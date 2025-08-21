@@ -1,0 +1,2963 @@
+// This code will automatically import, but I'm provided here for transparency
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+using System.Diagnostics;
+
+public class CPHInline
+{
+    // ===== Overlay Config Path Helpers =====
+    private string OverlayConfigDir() => System.IO.Path.Combine(OverlayRoot(), "config");
+    private string ConfigHtmlPath() => System.IO.Path.Combine(OverlayConfigDir(), "config.html");
+    private string ConfigJsPath() => System.IO.Path.Combine(OverlayConfigDir(), "config.js");
+    // ---------- Helpers ----------
+  
+    private int GetInt(string name, int def = 0, bool persist = true) => CPH.GetGlobalVar<int?>(name, persist) ?? def;
+    private string GetString(string name, string def = null, bool persist = true)
+    {
+        var s = CPH.GetGlobalVar<string>(name, persist);
+        return string.IsNullOrEmpty(s) ? (def ?? string.Empty) : s;
+    }
+
+    private bool GetBool(string name, bool def = false, bool persist = true) => CPH.GetGlobalVar<bool?>(name, persist) ?? def;
+    private void SetInt(string name, int value, bool persist = true) => CPH.SetGlobalVar(name, value, persist);
+    private void SetString(string name, string value, bool persist = true) => CPH.SetGlobalVar(name, value, persist);
+    private int SplitCount => GetInt("Split_Count", 0, true);
+
+    private void MaybeBroadcast()
+    {
+        if (GetBool("autoBroadcast", true, true))
+            broadcastSplitData();
+    }
+
+    private void RecalcTotals()
+    {
+        int splitCount = SplitCount;
+        int totalRun = 0, totalBoss = 0;
+        for (int i = 1; i <= splitCount; i++)
+        {
+            totalRun += GetInt($"currentrunHits_Split_{i}", 0, true);
+            totalBoss += GetInt($"currentbossHits_Split_{i}", 0, true);
+        }
+
+        SetInt("totalrunHits", totalRun, true);
+        SetInt("totalbossHits", totalBoss, true);
+    }
+// --- Timer helpers ---
+private double GetDouble(string name, double def = 0, bool persist = true) => CPH.GetGlobalVar<double?>(name, persist) ?? def;
+private void SetDouble(string name, double value, bool persist = true) => CPH.SetGlobalVar(name, value, persist);
+private void SetBool(string name, bool value, bool persist = true) => CPH.SetGlobalVar(name, value, persist);
+private double NowSec() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+
+    // ===================== PROFILES =====================
+    private string ProfilesRoot()
+    {
+        string sbRoot = AppDomain.CurrentDomain.BaseDirectory;
+        string @default = Path.Combine(sbRoot, "profiles", "hitcounters");
+        string root = GetString("profilesRoot", @default, true);
+        try
+        {
+            if (!Directory.Exists(root))
+                Directory.CreateDirectory(root);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"Failed to ensure profilesRoot '{root}': {ex.Message}");
+        }
+
+        return root;
+    }
+
+    private string SanitizeFileName(string name)
+    {
+        foreach (var c in Path.GetInvalidFileNameChars())
+            name = name.Replace(c, '_');
+        return name.Trim();
+    }
+
+    private string ProfilePath(string name)
+    {
+        var safe = SanitizeFileName(name);
+        return Path.Combine(ProfilesRoot(), $"{safe}.json");
+    }
+
+    private class ProfileSplit
+    {
+        public string Name { get; set; } = "";
+        public int PB { get; set; }
+    }
+
+    private class ProfileData
+    {
+        public int Schema { get; set; } = 2;
+        public string ProfileName { get; set; } = "";
+        public List<ProfileSplit> Splits { get; set; } = new List<ProfileSplit>();
+        public int TotalPB { get; set; }
+        public bool ShowRunHits { get; set; }
+        public bool ShowBossHits { get; set; }
+        public bool ShowPB { get; set; }
+        public bool ShowSplitTotal { get; set; }
+        public bool WrapNavigation { get; set; }
+        public bool AutoBroadcast { get; set; }
+        public string HitColor { get; set; } = "#ff0000";
+        public string NormalColor { get; set; } = "#00000000";
+        // THEME (12 fields)
+        public string BodyTextColor { get; set; } = "#EAE6CA";
+        public string HeaderBgColor { get; set; } = "#111";
+        public string HeaderTextColor { get; set; } = "#FDB515";
+        public string BorderColor { get; set; } = "#777";
+        public string CurrentOutlineColor { get; set; } = "#FDB515";
+        public string CurrentBgColor { get; set; } = "#003344";
+        public string FlashStartColor { get; set; } = "#ff0000";
+        public string FlashMidColor { get; set; } = "#660000";
+        public string PastZeroBgColor { get; set; } = "#157515";
+        public string PastZeroTextColor { get; set; } = "#EAE6CA";
+        public string FooterBgColor { get; set; } = "#111";
+        public string FooterTextColor { get; set; } = "#FDB515";
+    }
+
+    // Save current state into a named profile (args: profileName, backupIfExists=true)
+    public bool saveProfile()
+    {
+        if (!CPH.TryGetArg<string>("profileName", out var profileName) || string.IsNullOrWhiteSpace(profileName))
+        {
+            CPH.LogWarn("saveProfile: missing 'profileName' arg.");
+            return false;
+        }
+
+        bool backupIfExists = true;
+        CPH.TryGetArg<bool>("backupIfExists", out backupIfExists);
+        int count = GetInt("Split_Count", 0, true);
+        if (count <= 0)
+        {
+            CPH.LogWarn("saveProfile: nothing to save; Split_Count <= 0.");
+            return false;
+        }
+
+        var data = new ProfileData
+        {
+            ProfileName = profileName.Trim(),
+            TotalPB = GetInt("currentPB", 0, true),
+            ShowRunHits = GetBool("showRunHits", true, true),
+            ShowBossHits = GetBool("showBossHits", true, true),
+            ShowPB = GetBool("showPB", true, true),
+            ShowSplitTotal = GetBool("showSplitTotal", true, true),
+            WrapNavigation = GetBool("wrapNavigation", true, true),
+            AutoBroadcast = GetBool("autoBroadcast", true, true),
+            // read persistent vars
+            HitColor = GetString("hitColor", "#ff0000", true),
+            NormalColor = GetString("normalColor", "#00000000", true),
+            BodyTextColor = GetString("bodyTextColor", "#EAE6CA", true),
+            HeaderBgColor = GetString("headerBgColor", "#111", true),
+            HeaderTextColor = GetString("headerTextColor", "#FDB515", true),
+            BorderColor = GetString("borderColor", "#777", true),
+            CurrentOutlineColor = GetString("currentOutlineColor", "#FDB515", true),
+            CurrentBgColor = GetString("currentBgColor", "#003344", true),
+            FlashStartColor = GetString("flashStartColor", "#ff0000", true),
+            FlashMidColor = GetString("flashMidColor", "#660000", true),
+            PastZeroBgColor = GetString("pastZeroBgColor", "#157515", true),
+            PastZeroTextColor = GetString("pastZeroTextColor", "#EAE6CA", true),
+            FooterBgColor = GetString("footerBgColor", "#111", true),
+            FooterTextColor = GetString("footerTextColor", "#FDB515", true)
+        };
+        for (int i = 1; i <= count; i++)
+        {
+            string splitId = $"Split_{i}";
+            data.Splits.Add(new ProfileSplit { Name = GetString(splitId, $"Split {i}", true), PB = GetInt($"currentsplitPB_{splitId}", 0, true) });
+        }
+
+        string json = Newtonsoft.Json.JsonConvert.SerializeObject(data, Newtonsoft.Json.Formatting.Indented);
+        string path = ProfilePath(data.ProfileName);
+        if (File.Exists(path) && backupIfExists)
+        {
+            string ts = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string backup = Path.Combine(Path.GetDirectoryName(path), $"{Path.GetFileNameWithoutExtension(path)}_{ts}.bak.json");
+            try
+            {
+                File.Copy(path, backup, overwrite: false);
+            }
+            catch (Exception ex)
+            {
+                CPH.LogWarn($"saveProfile: failed to create backup: {ex.Message}");
+            }
+        }
+
+        File.WriteAllText(path, json);
+        SetString("activeProfile", data.ProfileName, true);
+        CPH.LogInfo($"Profile '{data.ProfileName}' saved to {path}");
+        return true;
+    }
+
+// --- Timer actions ---
+public bool timerStart()
+{
+    if (!GetBool("timerRunning", false, true))
+    {
+        SetDouble("timerStartSec", NowSec(), true);
+        SetBool("timerRunning", true, true);
+    }
+    MaybeBroadcast();
+    return true;
+}
+
+public bool timerStop()
+{
+    if (GetBool("timerRunning", false, true))
+    {
+        var start = GetDouble("timerStartSec", NowSec(), true);
+        var elapsed = GetDouble("timerElapsedBeforeSec", 0, true);
+        elapsed += Math.Max(0, NowSec() - start);
+        SetDouble("timerElapsedBeforeSec", elapsed, true);
+        SetBool("timerRunning", false, true);
+    }
+    MaybeBroadcast();
+    return true;
+}
+
+public bool timerReset()
+{
+    SetBool("timerRunning", false, true);
+    SetDouble("timerElapsedBeforeSec", 0, true);
+    SetDouble("timerStartSec", NowSec(), true);
+    MaybeBroadcast();
+    return true;
+}
+
+    // Load a profile (arg: profileName); resets current run counts
+    public bool loadProfile()
+    {
+        if (!CPH.TryGetArg<string>("profileName", out var profileName) || string.IsNullOrWhiteSpace(profileName))
+        {
+            CPH.LogWarn("loadProfile: missing 'profileName' arg.");
+            return false;
+        }
+
+        string path = ProfilePath(profileName);
+        if (!File.Exists(path))
+        {
+            CPH.LogWarn($"loadProfile: profile '{profileName}' not found at {path}");
+            return false;
+        }
+
+        string json = File.ReadAllText(path);
+        ProfileData data;
+        try
+        {
+            data = Newtonsoft.Json.JsonConvert.DeserializeObject<ProfileData>(json);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"loadProfile: failed to parse JSON: {ex.Message}");
+            return false;
+        }
+
+        if (data == null || data.Splits == null || data.Splits.Count == 0)
+        {
+            CPH.LogWarn("loadProfile: profile has no splits.");
+            return false;
+        }
+
+        // ----- Basic split & counters reset -----
+        SetInt("Split_Count", data.Splits.Count, true);
+        var splitNames = new List<string>();
+        for (int i = 0; i < data.Splits.Count; i++)
+        {
+            string splitId = $"Split_{i + 1}";
+            var s = data.Splits[i];
+            SetString(splitId, s.Name ?? $"Split {i + 1}", true);
+            SetInt($"currentsplitPB_{splitId}", Math.Max(0, s.PB), true);
+            SetInt($"currentrunHits_{splitId}", 0, true);
+            SetInt($"currentbossHits_{splitId}", 0, true);
+            splitNames.Add(GetString(splitId, $"Split {i + 1}", true));
+        }
+
+        SetString("split_list", string.Join(", ", splitNames), true);
+        SetInt("currentPB", Math.Max(0, data.TotalPB), true);
+        SetInt("totalrunHits", 0, true);
+        SetInt("totalbossHits", 0, true);
+        SetInt("currentSplit", 1, true);
+        // ----- Behavior flags -----
+        CPH.SetGlobalVar("showRunHits", data.ShowRunHits, true);
+        CPH.SetGlobalVar("showBossHits", data.ShowBossHits, true);
+        CPH.SetGlobalVar("showPB", data.ShowPB, true);
+        CPH.SetGlobalVar("showSplitTotal", data.ShowSplitTotal, true);
+        CPH.SetGlobalVar("wrapNavigation", data.WrapNavigation, true);
+        CPH.SetGlobalVar("autoBroadcast", data.AutoBroadcast, true);
+        // ----- THEME: only overwrite if the profile actually has a value -----
+        SetColorIfPresent("hitColor", data.HitColor);
+        SetColorIfPresent("normalColor", data.NormalColor);
+        SetColorIfPresent("bodyTextColor", data.BodyTextColor);
+        SetColorIfPresent("headerBgColor", data.HeaderBgColor);
+        SetColorIfPresent("headerTextColor", data.HeaderTextColor);
+        SetColorIfPresent("borderColor", data.BorderColor);
+        SetColorIfPresent("currentOutlineColor", data.CurrentOutlineColor);
+        SetColorIfPresent("currentBgColor", data.CurrentBgColor);
+        SetColorIfPresent("flashStartColor", data.FlashStartColor);
+        SetColorIfPresent("flashMidColor", data.FlashMidColor);
+        SetColorIfPresent("pastZeroBgColor", data.PastZeroBgColor);
+        SetColorIfPresent("pastZeroTextColor", data.PastZeroTextColor);
+        SetColorIfPresent("footerBgColor", data.FooterBgColor);
+        SetColorIfPresent("footerTextColor", data.FooterTextColor);
+        SetString("activeProfile", data.ProfileName, true);
+        CPH.LogInfo($"Profile '{data.ProfileName}' loaded. Splits={data.Splits.Count} | TotalPB={data.TotalPB}");
+        // ----- OPTIONAL: auto-migrate missing theme fields & bump schema -----
+        bool migrated = false;
+        string G(string key, string fallback = null) => GetString(key, fallback, true);
+        string FillIfMissing(string currentProfileValue, string globalKey)
+        {
+            if (!string.IsNullOrWhiteSpace(currentProfileValue))
+                return currentProfileValue;
+            var v = G(globalKey, null);
+            if (!string.IsNullOrWhiteSpace(v))
+            {
+                migrated = true;
+                return v;
+            }
+
+            return currentProfileValue;
+        }
+
+        // Fill any missing theme fields from current globals
+        data.HitColor = FillIfMissing(data.HitColor, "hitColor");
+        data.NormalColor = FillIfMissing(data.NormalColor, "normalColor");
+        data.BodyTextColor = FillIfMissing(data.BodyTextColor, "bodyTextColor");
+        data.HeaderBgColor = FillIfMissing(data.HeaderBgColor, "headerBgColor");
+        data.HeaderTextColor = FillIfMissing(data.HeaderTextColor, "headerTextColor");
+        data.BorderColor = FillIfMissing(data.BorderColor, "borderColor");
+        data.CurrentOutlineColor = FillIfMissing(data.CurrentOutlineColor, "currentOutlineColor");
+        data.CurrentBgColor = FillIfMissing(data.CurrentBgColor, "currentBgColor");
+        data.FlashStartColor = FillIfMissing(data.FlashStartColor, "flashStartColor");
+        data.FlashMidColor = FillIfMissing(data.FlashMidColor, "flashMidColor");
+        data.PastZeroBgColor = FillIfMissing(data.PastZeroBgColor, "pastZeroBgColor");
+        data.PastZeroTextColor = FillIfMissing(data.PastZeroTextColor, "pastZeroTextColor");
+        data.FooterBgColor = FillIfMissing(data.FooterBgColor, "footerBgColor");
+        data.FooterTextColor = FillIfMissing(data.FooterTextColor, "footerTextColor");
+        if (data.Schema < 3)
+        {
+            data.Schema = 3;
+            migrated = true;
+        }
+
+        if (migrated)
+        {
+            try
+            {
+                var jsonOut = Newtonsoft.Json.JsonConvert.SerializeObject(data, Newtonsoft.Json.Formatting.Indented);
+                File.WriteAllText(path, jsonOut);
+                CPH.LogInfo($"loadProfile: migrated theme fields and updated schema for '{data.ProfileName}'.");
+            }
+            catch (Exception ex)
+            {
+                CPH.LogWarn($"loadProfile: failed to migrate profile '{data.ProfileName}': {ex.Message}");
+            }
+        }
+
+        MaybeBroadcast();
+        return true;
+    }
+
+    public bool listProfiles()
+    {
+        var root = ProfilesRoot();
+        if (!Directory.Exists(root))
+        {
+            CPH.LogInfo("No profiles directory found.");
+            return true;
+        }
+
+        var files = Directory.GetFiles(root, "*.json", SearchOption.TopDirectoryOnly);
+        string active = GetString("activeProfile", "", true);
+        if (files.Length == 0)
+        {
+            CPH.LogInfo("No profiles have been saved yet.");
+            return true;
+        }
+
+        foreach (var f in files)
+        {
+            var name = Path.GetFileNameWithoutExtension(f);
+            var tag = (string.Equals(name, active, StringComparison.OrdinalIgnoreCase)) ? " (active)" : "";
+            CPH.LogInfo($"Profile: {name}{tag}");
+        }
+
+        return true;
+    }
+
+    public bool deleteProfile()
+    {
+        if (!CPH.TryGetArg<string>("profileName", out var profileName) || string.IsNullOrWhiteSpace(profileName))
+        {
+            CPH.LogWarn("deleteProfile: missing 'profileName' arg.");
+            return false;
+        }
+
+        string path = ProfilePath(profileName);
+        if (!File.Exists(path))
+        {
+            CPH.LogWarn($"deleteProfile: profile '{profileName}' not found.");
+            return false;
+        }
+
+        File.Delete(path);
+        CPH.LogInfo($"Profile '{profileName}' deleted.");
+        var active = GetString("activeProfile", "", true);
+        if (string.Equals(active, profileName, StringComparison.OrdinalIgnoreCase))
+            SetString("activeProfile", "", true);
+        return true;
+    }
+
+    // ===== THEMES (independent of split profiles) =====
+    private string ThemesRoot()
+    {
+        var root = Path.Combine(ProfilesRoot(), "themes");
+        try
+        {
+            if (!Directory.Exists(root))
+                Directory.CreateDirectory(root);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"Failed to ensure themes dir '{root}': {ex.Message}");
+        }
+
+        return root;
+    }
+
+    private string ThemePath(string name) => Path.Combine(ThemesRoot(), $"{SanitizeFileName(name)}.json");
+    // optional: active theme name
+    private string ActiveTheme { get => GetString("activeTheme", "", true); set => SetString("activeTheme", value ?? "", true); }
+
+    private class ThemeData
+    {
+        public int Schema { get; set; } = 1;
+        public string ThemeName { get; set; } = "";
+        // store only the theme fields (same keys you already use)
+        public Dictionary<string, string> Values { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    // ---------- Initialize / Startup ----------
+    public bool Execute()
+    {
+        // 1) Always ensure overlay + config assets exist (no overwrite)
+        CPH.SetArgument("forceOverwrite", false);
+        ensureOverlayAssets(); // writes overlay + config files if missing
+        EnsureThemeDefaults();
+        // 2) Prefer loading last active profile if it exists
+        string active = GetString("activeProfile", "", true);
+        if (!string.IsNullOrWhiteSpace(active))
+        {
+            string path = ProfilePath(active);
+            if (System.IO.File.Exists(path))
+            {
+                CPH.LogInfo($"Execute: found activeProfile '{active}', loading it.");
+                CPH.SetArgument("profileName", active);
+                var ok = loadProfile();
+                if (ok)
+                {
+                    MaybeBroadcast();
+                    return true;
+                }
+            }
+            else
+            {
+                CPH.LogWarn($"Execute: activeProfile '{active}' not found on disk. Falling back to split_list init.");
+            }
+        }
+
+        // 3) Fallback to split_list initialization (create a 1-split default if truly empty)
+        string splitList = GetString("split_list", "", true);
+        if (string.IsNullOrWhiteSpace(splitList))
+        {
+            splitList = "Split 1";
+            SetString("split_list", splitList, true);
+            SetInt("Split_Count", 1, true);
+            SetString("Split_1", "Split 1", true);
+            SetInt("currentsplitPB_Split_1", 0, true);
+            SetInt("currentrunHits_Split_1", 0, true);
+            SetInt("currentbossHits_Split_1", 0, true);
+            CPH.LogInfo("Execute: created default split_list with 1 split.");
+        }
+
+        string[] items = splitList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < items.Length; i++)
+        {
+            string splitId = $"Split_{i + 1}";
+            string value = items[i].Trim();
+            SetString(splitId, value, true);
+            SetInt($"currentrunHits_{splitId}", 0, true);
+            SetInt($"currentbossHits_{splitId}", 0, true);
+            if (GetInt($"currentsplitPB_{splitId}", -1, true) < 0)
+                SetInt($"currentsplitPB_{splitId}", 0, true);
+        }
+
+        SetInt("totalrunHits", 0, true);
+        SetInt("totalbossHits", 0, true);
+        SetInt("currentSplit", 1, true);
+        SetInt("Split_Count", items.Length, true);
+        CPH.SetGlobalVar("autoBroadcast", GetBool("autoBroadcast", true, true), true);
+        CPH.SetGlobalVar("wrapNavigation", GetBool("wrapNavigation", true, true), true);
+        MaybeBroadcast();
+        return true;
+    }
+
+    // ---------- Navigation ----------
+    public bool setCurrentSplit()
+    {
+        CPH.TryGetArg<int>("change", out int change);
+        int splitCount = SplitCount;
+        if (splitCount <= 0)
+            return false;
+        bool wrap = GetBool("wrapNavigation", true, true);
+        int current = GetInt("currentSplit", 1, true);
+        if (wrap)
+        {
+            current = ((current - 1 + change) % splitCount + splitCount) % splitCount + 1;
+        }
+        else
+        {
+            current = Math.Max(1, Math.Min(current + change, splitCount));
+        }
+
+        SetInt("currentSplit", current, true);
+        CPH.LogInfo($"Current active split set to Split_{current}");
+        MaybeBroadcast();
+        return true;
+    }
+
+public bool setCurrentSplitToIndex()
+{
+    int splitCount = SplitCount;
+    if (splitCount <= 0) return false;
+
+    int index;
+    if (!CPH.TryGetArg<int>("index", out index))
+    {
+        if (!CPH.TryGetArg<int>("idx", out index) &&
+            !CPH.TryGetArg<int>("i", out index))
+        {
+            int zi;
+            if (CPH.TryGetArg<int>("zeroIndex", out zi)) index = zi + 1;
+            else index = GetInt("currentSplit", 1, true);
+        }
+    }
+
+    index = Math.Max(1, Math.Min(index, splitCount));
+    SetInt("currentSplit", index, true);
+    CPH.LogInfo($"Current active split set to Split_{index}");
+    MaybeBroadcast();
+    return true;
+}
+
+
+    // ---------- Hits + Undo ----------
+public bool runHits()
+{
+    CPH.TryGetArg<int>("change", out int change);
+    int target = GetInt("currentSplit", 1, true);
+    // Optional target override
+    if (CPH.TryGetArg<int>("index", out var idx) || CPH.TryGetArg<int>("idx", out idx) || CPH.TryGetArg<int>("i", out idx))
+        target = idx;
+    else if (CPH.TryGetArg<int>("zeroIndex", out var zi))
+        target = zi + 1;
+
+    int max = SplitCount;
+    if (max > 0) target = Math.Max(1, Math.Min(target, max));
+
+    string splitId = $"Split_{target}";
+    string varName = $"currentrunHits_{splitId}";
+    int v = Math.Max(0, GetInt(varName, 0, true) + change);
+    SetInt(varName, v, true);
+    RecalcTotals();
+    CPH.SetGlobalVar("lastChange_type", "run", true);
+    CPH.SetGlobalVar("lastChange_split", target, true);
+    CPH.SetGlobalVar("lastChange_amount", change, true);
+    CPH.LogInfo($"Updated {varName} to {v}");
+    MaybeBroadcast();
+    return true;
+}
+
+public bool bossHits()
+{
+    CPH.TryGetArg<int>("change", out int change);
+    int target = GetInt("currentSplit", 1, true);
+    if (CPH.TryGetArg<int>("index", out var idx) || CPH.TryGetArg<int>("idx", out idx) || CPH.TryGetArg<int>("i", out idx))
+        target = idx;
+    else if (CPH.TryGetArg<int>("zeroIndex", out var zi))
+        target = zi + 1;
+
+    int max = SplitCount;
+    if (max > 0) target = Math.Max(1, Math.Min(target, max));
+
+    string splitId = $"Split_{target}";
+    string varName = $"currentbossHits_{splitId}";
+    int v = Math.Max(0, GetInt(varName, 0, true) + change);
+    SetInt(varName, v, true);
+    RecalcTotals();
+    CPH.SetGlobalVar("lastChange_type", "boss", true);
+    CPH.SetGlobalVar("lastChange_split", target, true);
+    CPH.SetGlobalVar("lastChange_amount", change, true);
+    CPH.LogInfo($"Updated {varName} to {v}");
+    MaybeBroadcast();
+    return true;
+}
+
+
+    public bool undoLastChange()
+    {
+        string type = GetString("lastChange_type", "", true);
+        int split = GetInt("lastChange_split", 0, true);
+        int amount = GetInt("lastChange_amount", 0, true);
+        if (string.IsNullOrEmpty(type) || split <= 0 || amount == 0)
+        {
+            CPH.LogWarn("No last change to undo.");
+            return false;
+        }
+
+        string splitId = $"Split_{split}";
+        string varName = type == "run" ? $"currentrunHits_{splitId}" : $"currentbossHits_{splitId}";
+        int v = Math.Max(0, GetInt(varName, 0, true) - amount);
+        SetInt(varName, v, true);
+        CPH.SetGlobalVar("lastChange_type", "", true);
+        CPH.SetGlobalVar("lastChange_split", 0, true);
+        CPH.SetGlobalVar("lastChange_amount", 0, true);
+        RecalcTotals();
+        CPH.LogInfo($"Undo applied to {varName}, new value {v}");
+        MaybeBroadcast();
+        return true;
+    }
+
+    // ---------- PB ----------
+    public bool saveCurrentRunAsPB()
+    {
+        bool onlyIfBetter = false;
+        CPH.TryGetArg<bool>("onlyIfBetter", out onlyIfBetter);
+        int splitCount = SplitCount;
+        int totalCurrentPB = 0;
+        for (int i = 1; i <= splitCount; i++)
+        {
+            string splitId = $"Split_{i}";
+            int runHits = GetInt($"currentrunHits_{splitId}", 0, true);
+            int bossHits = GetInt($"currentbossHits_{splitId}", 0, true);
+            int totalHits = runHits + bossHits;
+            if (onlyIfBetter)
+            {
+                int existingPB = GetInt($"currentsplitPB_{splitId}", int.MaxValue, true);
+                if (totalHits < existingPB)
+                    SetInt($"currentsplitPB_{splitId}", totalHits, true);
+            }
+            else
+            {
+                SetInt($"currentsplitPB_{splitId}", totalHits, true);
+            }
+
+            totalCurrentPB += GetInt($"currentsplitPB_{splitId}", 0, true);
+        }
+
+        SetInt("currentPB", totalCurrentPB, true);
+        CPH.LogInfo($"Saved current run as PB (onlyIfBetter={onlyIfBetter}). Total PB: {totalCurrentPB}");
+        MaybeBroadcast();
+        return true;
+    }
+
+    // ---------- Reset ----------
+    public bool resetCurrentRun()
+    {
+        int splitCount = SplitCount;
+        for (int i = 1; i <= splitCount; i++)
+        {
+            string splitId = $"Split_{i}";
+            SetInt($"currentrunHits_{splitId}", 0, true);
+            SetInt($"currentbossHits_{splitId}", 0, true);
+        }
+
+        SetInt("totalrunHits", 0, true);
+        SetInt("totalbossHits", 0, true);
+        SetInt("currentSplit", 1, true);
+        CPH.SetGlobalVar("lastChange_type", "", true);
+        CPH.SetGlobalVar("lastChange_split", 0, true);
+        CPH.SetGlobalVar("lastChange_amount", 0, true);
+        CPH.LogInfo("Current run has been reset. All hit counts cleared and split reset to 1.");
+        MaybeBroadcast();
+        return true;
+    }
+
+    public bool resetSingleSplit()
+    {
+        int idx = GetInt("currentSplit", 1, true);
+        string splitId = $"Split_{idx}";
+        SetInt($"currentrunHits_{splitId}", 0, true);
+        SetInt($"currentbossHits_{splitId}", 0, true);
+        RecalcTotals();
+        CPH.LogInfo($"Split {idx} has been reset.");
+        MaybeBroadcast();
+        return true;
+    }
+
+    // ---------- Broadcast ----------
+public bool broadcastSplitData()
+{
+    int splitCount = GetInt("Split_Count", 0, true);
+    var splitDataList = new List<Dictionary<string, object>>();
+    int totalHits = 0;
+    int currentPB = GetInt("currentPB", 0, true);
+    int currentSplitIndex = GetInt("currentSplit", 1, true);
+
+    for (int i = 1; i <= splitCount; i++)
+    {
+        string splitId = $"Split_{i}";
+        string name = GetString(splitId, $"Split {i}", true);
+        int runHits = GetInt($"currentrunHits_{splitId}", 0, true);
+        int bossHits = GetInt($"currentbossHits_{splitId}", 0, true);
+        int pb = GetInt($"currentsplitPB_{splitId}", 0, true);
+        int splitTotal = runHits + bossHits;
+        totalHits += splitTotal;
+        splitDataList.Add(new Dictionary<string, object> {
+            ["name"] = name, ["runHits"] = runHits, ["bossHits"] = bossHits, ["pb"] = pb, ["total"] = splitTotal
+        });
+    }
+
+    // --- Timer fields ---
+    bool timerRunning = GetBool("timerRunning", false, true);
+    double baseSec = GetDouble("timerElapsedBeforeSec", 0, true);
+    double startSec = GetDouble("timerStartSec", 0, true);
+    double now = NowSec();
+    double elapsedSec = baseSec + (timerRunning ? Math.Max(0, now - startSec) : 0);
+    long elapsedMs = (long)Math.Round(elapsedSec * 1000.0);
+
+    var data = new Dictionary<string, object>
+    {
+        ["splits"] = splitDataList,
+        ["totalHits"] = totalHits,
+        ["currentPB"] = currentPB,
+        ["hitsToPB"] = currentPB - totalHits,
+        ["currentSplitIndex"] = currentSplitIndex,
+
+        // flags
+        ["showRunHits"] = GetBool("showRunHits", true, true),
+        ["showBossHits"] = GetBool("showBossHits", true, true),
+        ["showPB"] = GetBool("showPB", true, true),
+        ["showSplitTotal"] = GetBool("showSplitTotal", true, true),
+
+        // colors
+        ["hitColor"] = GetString("hitColor", "#ff0000", true),
+        ["normalColor"] = GetString("normalColor", "#00000000", true),
+        ["bodyTextColor"] = GetString("bodyTextColor", "#EAE6CA", true),
+        ["headerBgColor"] = GetString("headerBgColor", "#111", true),
+        ["headerTextColor"] = GetString("headerTextColor", "#FDB515", true),
+        ["borderColor"] = GetString("borderColor", "#777", true),
+        ["currentOutlineColor"] = GetString("currentOutlineColor", "#FDB515", true),
+        ["currentBgColor"] = GetString("currentBgColor", "#003344", true),
+        ["flashStartColor"] = GetString("flashStartColor", "#ff0000", true),
+        ["flashMidColor"] = GetString("flashMidColor", "#660000", true),
+        ["pastZeroBgColor"] = GetString("pastZeroBgColor", "#157515", true),
+        ["pastZeroTextColor"] = GetString("pastZeroTextColor", "#EAE6CA", true),
+        ["footerBgColor"] = GetString("footerBgColor", "#111", true),
+        ["footerTextColor"] = GetString("footerTextColor", "#FDB515", true),
+
+        // --- Timer payload ---
+        ["timerRunning"] = timerRunning,
+        ["timerElapsedMs"] = elapsedMs
+    };
+
+    var payload = new Dictionary<string, object>
+    {
+        ["request"] = "splitStatusUpdate",
+        ["data"] = data
+    };
+    string json = Newtonsoft.Json.JsonConvert.SerializeObject(payload);
+    CPH.WebsocketBroadcastJson(json);
+    CPH.LogInfo($"Broadcasted {splitCount} splits | totalHits={totalHits} | PB={currentPB} | active={currentSplitIndex} | timerRunning={timerRunning} elapsedMs={elapsedMs}");
+    return true;
+}
+
+
+    // ===== Overlay asset bootstrap (uses your HTML/CSS) =====
+    private const string OverlayAssetsVersion = "1.0.2";
+    private string OverlayRoot()
+    {
+        string sbRoot = AppDomain.CurrentDomain.BaseDirectory;
+        string @default = System.IO.Path.Combine(sbRoot, "overlays", "hitcounter");
+        string root = GetString("overlayRoot", @default, true);
+        try
+        {
+            if (!System.IO.Directory.Exists(root))
+                System.IO.Directory.CreateDirectory(root);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"Failed to ensure overlayRoot '{root}': {ex.Message}");
+        }
+
+        return root;
+    }
+
+    private string OverlayHtmlPath() => System.IO.Path.Combine(OverlayRoot(), "split_overlay.html");
+    private string OverlayCssPath() => System.IO.Path.Combine(OverlayRoot(), "styles.css");
+    private string OverlayReadmePath() => System.IO.Path.Combine(OverlayRoot(), "README.txt");
+private string DefaultHtml()
+{
+    return @"<!DOCTYPE html>
+<html lang=""en"">
+<head>
+  <meta charset=""UTF-8"" />
+  <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"" />
+  <title>Split Tracker Overlay</title>
+  <link rel=""stylesheet"" href=""styles.css"" />
+  <style id=""hcVars""></style>
+</head>
+<body>
+  <div id=""timerDisplay"">00:00.00</div>
+
+  <table id=""splitTable"">
+    <thead><tr id=""headerRow""></tr></thead>
+    <tbody id=""tableBody""></tbody>
+    <tfoot><tr id=""footerRow""></tr></tfoot>
+  </table>
+
+  <div id=""debug"">Connecting...</div>
+
+  <script>
+    const debug = document.getElementById('debug');
+    const varStyle = document.getElementById('hcVars');
+    const timerEl = document.getElementById('timerDisplay');
+
+    // smooth timer: snap to centiseconds, update only when visible text changes
+    const tState = { running:false, baseMs:0, raf:0, startPerf:0, lastText:'' };
+    function fmt(ms){
+      ms = Math.max(0, Math.floor(ms));
+      const cs = Math.floor((ms % 1000) / 10);
+      const s  = Math.floor(ms / 1000) % 60;
+      const m  = Math.floor(ms / 60000);
+      return String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0') + '.' + String(cs).padStart(2,'0');
+    }
+    function tTick(){
+      if(!tState.running){ tState.raf=0; return; }
+      const elapsed = tState.baseMs + (performance.now() - tState.startPerf);
+      const ms = Math.floor(elapsed / 10) * 10;      // snap to 10ms
+      const txt = fmt(ms);
+      if (txt !== tState.lastText) {
+        tState.lastText = txt;
+        if (timerEl) timerEl.textContent = txt;
+      }
+      tState.raf = requestAnimationFrame(tTick);
+    }
+    function syncTimer(payload){
+      const running = !!payload.timerRunning;
+      const ms = Math.max(0, +payload.timerElapsedMs || 0);
+      tState.baseMs   = ms;
+      tState.startPerf = performance.now();
+      tState.lastText = '';
+      if(timerEl) timerEl.textContent = fmt(ms);
+      if(tState.raf){ cancelAnimationFrame(tState.raf); tState.raf=0; }
+      tState.running = running;
+      if(running) tState.raf = requestAnimationFrame(tTick);
+    }
+
+    function parseSBMessage(raw){
+      let m={}; try{ m=JSON.parse(raw); }catch{ return {req:null,payload:null}; }
+      const req = (m?.data?.request) ?? m?.request ?? null;
+      const payload = (m?.data?.data) ?? m?.data ?? m ?? null;
+      return { req, payload };
+    }
+
+    function applyTheme(d){
+      if(!d) return;
+      const map = [
+        ['bodyTextColor','--hc-body-text'],
+        ['headerBgColor','--hc-header-bg'],
+        ['headerTextColor','--hc-header-text'],
+        ['borderColor','--hc-border'],
+        ['currentOutlineColor','--hc-current-outline'],
+        ['currentBgColor','--hc-current-bg'],
+        ['flashStartColor','--hc-flash-start'],
+        ['flashMidColor','--hc-flash-mid'],
+        ['pastZeroBgColor','--hc-pastzero-bg'],
+        ['pastZeroTextColor','--hc-pastzero-text'],
+        ['footerBgColor','--hc-footer-bg'],
+        ['footerTextColor','--hc-footer-text']
+      ];
+      const vars=[];
+      for(const [key,cssVar] of map){
+        const v=d[key];
+        if(typeof v==='string' && v.trim()) vars.push(`${cssVar}:${v.trim()};`);
+      }
+      const dyn=[];
+      if(d.footerBgColor||d.footerTextColor){
+        dyn.push(`tfoot td{background-color:${(d.footerBgColor||'var(--hc-footer-bg)')};color:${(d.footerTextColor||'var(--hc-footer-text)')};}`);
+      }
+      if(d.pastZeroBgColor||d.pastZeroTextColor){
+        dyn.push(`tr.past-zero td{background-color:${(d.pastZeroBgColor||'var(--hc-pastzero-bg)')};color:${(d.pastZeroTextColor||'var(--hc-pastzero-text)')};}`);
+      }
+      if(d.flashStartColor||d.flashMidColor){
+        const a=(d.flashStartColor||'var(--hc-flash-start)');
+        const b=(d.flashMidColor||'var(--hc-flash-mid)');
+        dyn.push(`@keyframes flashHitDyn{0%{background-color:${a};}50%{background-color:${b};}100%{background-color:${a};}}`);
+        dyn.push(`tr.current.hit-flash-dyn td{animation:flashHitDyn 0.5s ease-in-out;}`);
+      }
+      varStyle.textContent = (vars.length?`:root{ ${vars.join(' ')} }`:'') + (dyn.length?(' '+dyn.join(' ')):'');
+    }
+
+    const socket = new WebSocket('ws://localhost:8080');
+    socket.onopen = () => {
+      debug.innerText = '✅ WebSocket connected.';
+      socket.send(JSON.stringify({ request:'Subscribe', id:'overlay-subscription', events:{ General:['Custom'] } }));
+      debug.innerText += '\n📨 Sent subscription request for Custom events.';
+    };
+    socket.onerror = (err) => { debug.innerText = `❌ WebSocket error: ${JSON.stringify(err)}`; };
+    socket.onclose = () => { debug.innerText = '⚠️ WebSocket closed. Check Streamer.bot.'; };
+
+    socket.onmessage = (event) => {
+      debug.innerText = `📦 Raw: ${event.data}`;
+      const { req, payload } = parseSBMessage(event.data);
+      if(!req){ debug.innerText += '\n⏭ Unknown message shape'; return; }
+      if(req!=='splitStatusUpdate' && req!=='exportState' && req!=='Test'){ debug.innerText += `\n⏭ Ignored: ${req}`; return; }
+
+      applyTheme(payload||{});
+      syncTimer(payload||{});
+
+      const {
+        splits=[], totalHits=0, currentPB=0, hitsToPB=0, currentSplitIndex=1,
+        showRunHits=true, showBossHits=true, showPB=true, showSplitTotal=true,
+        hitColor='#ff0000', normalColor='#00000000',
+        pastZeroBgColor=null, pastZeroTextColor=null
+      } = payload || {};
+
+      const headerRow=document.getElementById('headerRow');
+      const tableBody=document.getElementById('tableBody');
+      const footerRow=document.getElementById('footerRow');
+      headerRow.innerHTML=''; tableBody.innerHTML=''; footerRow.innerHTML='';
+
+      headerRow.innerHTML += `<th class=""col-split"">Split</th>`;
+      if(showPB)        headerRow.innerHTML += `<th class=""col-pb"">PB</th>`;
+      if(showRunHits)   headerRow.innerHTML += `<th class=""col-runhits"">Run</th>`;
+      if(showBossHits)  headerRow.innerHTML += `<th class=""col-bosshits"">Boss</th>`;
+      if(showSplitTotal)headerRow.innerHTML += `<th class=""col-totalhits"">Total</th>`;
+
+      splits.forEach((split, idx) => {
+        const tr=document.createElement('tr');
+        const sum=(split.runHits||0)+(split.bossHits||0);
+        const isHit=sum>0;
+        const isCurrent=(idx+1===currentSplitIndex);
+        const isPastZero=(!isCurrent)&&(idx<(currentSplitIndex-1))&&!isHit;
+
+        if(isCurrent){
+          tr.classList.add('current');
+          if(isHit){ tr.classList.add('hit-flash'); tr.classList.add('hit-flash-dyn'); }
+        }else if(isPastZero){
+          tr.classList.add('past-zero');
+          if(pastZeroBgColor) tr.style.backgroundColor=pastZeroBgColor;
+          if(pastZeroTextColor) tr.style.color=pastZeroTextColor;
+        }else{
+          tr.style.backgroundColor = isHit ? hitColor : normalColor;
+        }
+
+        tr.innerHTML += `<td class=""col-split"">${split.name??''}</td>`;
+        if(showPB)        tr.innerHTML += `<td class=""col-pb"">${split.pb??0}</td>`;
+        if(showRunHits)   tr.innerHTML += `<td class=""col-runhits"">${split.runHits??0}</td>`;
+        if(showBossHits)  tr.innerHTML += `<td class=""col-bosshits"">${split.bossHits??0}</td>`;
+        if(showSplitTotal)tr.innerHTML += `<td class=""col-totalhits"">${sum}</td>`;
+        tableBody.appendChild(tr);
+      });
+
+      footerRow.innerHTML = `<td colspan=""5"">Total Hits: ${totalHits} | PB: ${currentPB} | Hits to PB: ${hitsToPB}</td>`;
+      debug.innerText += `\n✅ Event: ${req} — rows: ${splits.length}, active: ${currentSplitIndex}`;
+    };
+  </script>
+</body>
+</html>";
+}
+
+    private string DefaultReadme()
+    {
+        return $@"Hit Counter Overlay (v{OverlayAssetsVersion})
+----------------------------------------------
+This extension was created over the course of a year, originally drawing from data provided by the wonderful application created by Topeterk. The original build of this extension parsed data provided by the HCM program.
+While this no longer uses any part of HCM, I cannot overstate how HCM has impacted the direction of this project. Be sure to check that out if you are not happy with this extenstion.
+I'll be uploading different use case examples, exports, and other updates on the Team Hitless Discord, Streamer.bot Discord, and the project's gitthub. https://github.com/AnthemionTV/Anthemion-s-Hit-Counter-Extension
+
+
+Beyond that acknowledgement, I'd like to thank my loving wife Shy_Force for supporting me in my ADHD fueled short term hobbies, long term fixations, and everything in between. Thank you to my community as well as the Team Hitless community. Both of these groups of wonderful people have become second families. 
+Thank you to Greydotcom, AshynDev, Ki11ahb, Ukuleleaversion for testing and providing feedback on previous versions. 
+
+Files were created automatically by running the 'first time setup' action. Use the JSON export feature to share settings or share the files themselves!
+
+- split_overlay.html : your overlay HTML (listens on ws://localhost:8080 by default, but you can change this to match your websocket settings)
+- styles.css         : your CSS, some color variables are drawn by the provided UI but other customization is possible via CSS.
+- To change the folder, set persistent global: overlayRoot
+- To regenerate defaults, run ensureOverlayAssets(forceOverwrite=true)";
+    }
+
+    private void WriteFileIfMissing(string path, string content, bool force)
+    {
+        try
+        {
+            if (force || !System.IO.File.Exists(path))
+                System.IO.File.WriteAllText(path, content);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"Failed to write '{path}': {ex.Message}");
+        }
+    }
+
+    public bool ensureOverlayAssets()
+    {
+        bool force = false;
+        CPH.TryGetArg<bool>("forceOverwrite", out force);
+        string root = OverlayRoot();
+        try
+        {
+            if (!System.IO.Directory.Exists(root))
+                System.IO.Directory.CreateDirectory(root);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"ensureOverlayAssets: {ex.Message}");
+        }
+
+        WriteFileIfMissing(OverlayHtmlPath(), DefaultHtml(), force);
+        WriteFileIfMissing(OverlayCssPath(), DefaultCss(), force);
+        WriteFileIfMissing(OverlayReadmePath(), DefaultReadme(), force);
+        try
+        {
+            if (!System.IO.Directory.Exists(OverlayConfigDir()))
+                System.IO.Directory.CreateDirectory(OverlayConfigDir());
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"ensureOverlayAssets (config dir): {ex.Message}");
+        }
+
+        WriteFileIfMissing(ConfigHtmlPath(), DefaultConfigHtml(), force);
+        WriteFileIfMissing(ConfigJsPath(), DefaultConfigJs(), force);
+        CPH.LogInfo($"Overlay & Config assets ensured at: {root} (forceOverwrite={force})");
+        return true;
+    }
+
+    private string DefaultCss()
+{
+    return @"/* Universal Box Model Fix */
+* { box-sizing: border-box; }
+
+@import url('https://fonts.googleapis.com/css2?family=Barlow&display=swap');
+/* Timer display */
+#timerDisplay{
+  text-align:center;
+  margin: 0 auto 8px;
+  font-weight:bold;
+  font-size: clamp(20px, 3vw, 28px);
+  color: var(--hc-header-text, #FDB515);
+
+  /* anti-jitter: equal-width digits & stable box */
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: ""tnum"" 1, ""lnum"" 1;
+  font-family: 'Barlow', ui-monospace, SFMono-Regular, Menlo, Consolas, ""Liberation Mono"", monospace;
+  display: inline-block;
+  min-width: 10ch;
+  will-change: transform;
+  transform: translateZ(0);
+}
+
+body {
+  font-family: 'Barlow', sans-serif;
+  background-color: transparent;
+  color: var(--hc-body-text, #EAE6CA);
+}
+
+table {
+  table-layout: fixed;
+  width: auto;
+  max-width: 600px;
+  margin: 0 auto;
+  border-collapse: collapse;
+  font-size: clamp(21px, 2vw, 18px);
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.1);
+}
+
+th, td {
+  padding: 2px 4px;
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+  border: 1px solid var(--hc-border, #777);
+  padding: 0.5rem;
+  text-align: center;
+}
+
+th {
+  background-color: var(--hc-header-bg, #111);
+  color: var(--hc-header-text, #FDB515);
+  font-size: 15px;
+  text-shadow: 0 0 0px #00ffff88;
+}
+
+tr.current td {
+  outline: 2px solid var(--hc-current-outline, #FDB515);
+  background-color: var(--hc-current-bg, #003344);
+  animation: pulseBorder 1.5s ease-in-out;
+}
+
+tr.current.hit-flash td {
+  animation: flashHit 0.5s ease-in-out;
+  color: #a70404;
+}
+
+@keyframes pulseBorder {
+  0%   { box-shadow: 0 0 5px 2px var(--hc-current-outline, #FDB515); }
+  50%  { box-shadow: 0 0 15px 4px var(--hc-current-outline, #FDB515); }
+  100% { box-shadow: 0 0 5px 2px var(--hc-current-outline, #FDB515); }
+}
+
+@keyframes flashHit {
+  0%   { background-color: var(--hc-flash-start, #ff0000); }
+  50%  { background-color: var(--hc-flash-mid,   #660000); }
+  100% { background-color: var(--hc-flash-start, #ff0000); }
+}
+
+tr.past-zero td {
+  color: var(--hc-pastzero-text, #EAE6CA);
+  background-color: var(--hc-pastzero-bg, #157515);
+}
+
+tfoot td {
+  background-color: var(--hc-footer-bg, #111);
+  font-weight: bold;
+  color: var(--hc-footer-text, #FDB515);
+}
+
+#debug {
+  margin-top: 1rem;
+  font-size: 21px;
+  color: #ff0000;
+  white-space: pre-wrap;
+}
+
+th.col-split, td.col-split {
+  text-align: left;
+  padding-left: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: auto;
+  max-width: 400px;
+}
+th.col-pb, td.col-pb,
+th.col-runhits, td.col-runhits,
+th.col-bosshits, td.col-bosshits,
+th.col-totalhits, td.col-totalhits {
+  width: 20px;
+  min-width: 50px;
+  max-width: 50px;
+}";
+}
+
+private string DefaultConfigHtml()
+{
+    return @"<!doctype html>
+<html lang='en'>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width,initial-scale=1'>
+  <title>Anthemion's Hit Counter Extension</title>
+  <style>
+    :root{ --gap:12px; --card-bg:#111827; --card-bd:#1f2a44; --input-bg:#0b1220; --input-bd:#243657; --text:#e6edf3; --muted:#a3b0c2; }
+    *{box-sizing:border-box}
+    body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:var(--text);background:#0b0f14;margin:0}
+    header{padding:16px 20px;background:#0f172a;border-bottom:1px solid var(--card-bd)}
+    h1{font-size:20px;margin:0 0 6px 0}
+    header .sub{font-size:13px;color:var(--muted)} header .sub a{color:#7dd3fc;text-decoration:none}
+    main{padding:16px 20px;display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+    section{background:var(--card-bg);border:1px solid var(--card-bd);border-radius:12px;padding:14px}
+    h2{font-size:16px;margin:0 0 10px 0;color:#7dd3fc}
+    label{display:inline-flex;align-items:center;gap:6px;margin:4px 10px 4px 0}
+    input[type='text'],input[type='number'],select{background:var(--input-bg);border:1px solid var(--input-bd);color:var(--text);padding:6px 8px;border-radius:8px}
+    .hex{width:60px} .num{width:56px;text-align:right} .name{width:240px}
+    .mini{padding:2px 6px;border-radius:6px;font-size:12px;background:#1f2a44;border:1px solid #2a3a5a;color:var(--text);cursor:pointer}
+    .mini:hover{filter:brightness(1.1)}
+    button{background:#1f2a44;border:1px solid #2a3a5a;color:var(--text);padding:6px 10px;border-radius:8px;cursor:pointer}
+    button:hover{filter:brightness(1.1)}
+    .muted{color:var(--muted);font-size:13px}
+    .pill{background:var(--input-bg);border:1px solid var(--input-bd);padding:4px 8px;border-radius:999px;font-family:ui-monospace,Consolas,monospace}
+
+    .colors{display:grid;grid-template-columns:repeat(4, minmax(230px,1fr));gap:10px 12px}
+    .color-field{display:grid;grid-template-columns:auto 28px 64px;align-items:center;gap:6px;min-width:0}
+    .color-field .sw{width:28px;height:28px;border:none;border-radius:6px;background:transparent;padding:0}
+    .color-field .hex{width:60px}
+
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px dashed #2a3a5a;padding:6px 8px;font-size:14px;text-align:left;vertical-align:middle}
+    td input.num{width:56px}
+
+    #overlayFrame{width:100%;height:420px;border:1px solid var(--input-bd);border-radius:10px;background:var(--input-bg)}
+    #overlayNote{margin-top:6px}
+    #overlayPaths code{display:block;margin:4px 0}
+
+    #secCustom{grid-column:1} #secOverlayLive{grid-column:2}
+    #secSplits{grid-column:1 / span 2}
+    #secThemes{grid-column:1} #secProfiles{grid-column:2}
+    #secJson{grid-column:1 / span 2}
+    #secPreviewSB{grid-column:1} #secConnection{grid-column:2}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Anthemion's Hit Counter Extension</h1>
+    <div class='sub'>created by <a href='https://www.twitch.tv/anthemiontv' target='_blank' rel='noopener noreferrer'>AnthemionTV</a></div>
+  </header>
+
+  <main>
+    <section id='secCustom'>
+      <h2>Customization</h2>
+      <div class='row' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>
+        <label><input id='fRun' type='checkbox'> Show Run</label>
+        <label><input id='fBoss' type='checkbox'> Show Boss</label>
+        <label><input id='fPB' type='checkbox'> Show PB</label>
+        <label><input id='fTot' type='checkbox'> Show Split Total</label>
+        <label><input id='fWrap' type='checkbox'> Wrap Navigation</label>
+        <label><input id='fAuto' type='checkbox'> Auto-Broadcast</label>
+      </div>
+
+      <h2 style='margin-top:14px'>Colors</h2>
+      <div class='colors'>
+        <label class='color-field'>Header Background
+          <input id='cHeaderBg_sw' class='sw' type='color'><input id='cHeaderBg' class='hex' type='text' value='#111'>
+        </label>
+        <label class='color-field'>Header Text
+          <input id='cHeaderText_sw' class='sw' type='color'><input id='cHeaderText' class='hex' type='text' value='#FDB515'>
+        </label>
+        <label class='color-field'>Border
+          <input id='cBorder_sw' class='sw' type='color'><input id='cBorder' class='hex' type='text' value='#777'>
+        </label>
+        <label class='color-field'>Body Text
+          <input id='cBodyText_sw' class='sw' type='color'><input id='cBodyText' class='hex' type='text' value='#EAE6CA'>
+        </label>
+        <label class='color-field'>Current Outline
+          <input id='cCurOutline_sw' class='sw' type='color'><input id='cCurOutline' class='hex' type='text' value='#FDB515'>
+        </label>
+        <label class='color-field'>Current Background
+          <input id='cCurBg_sw' class='sw' type='color'><input id='cCurBg' class='hex' type='text' value='#003344'>
+        </label>
+        <label class='color-field'>Hit
+          <input id='hitColor_sw' class='sw' type='color'><input id='hitColor' class='hex' type='text' value='#ff0000'>
+        </label>
+        <label class='color-field'>Normal
+          <input id='normColor_sw' class='sw' type='color'><input id='normColor' class='hex' type='text' value='#00000000'>
+        </label>
+        <label class='color-field'>Hit Flash 1
+          <input id='cFlashA_sw' class='sw' type='color'><input id='cFlashA' class='hex' type='text' value='#ff0000'>
+        </label>
+        <label class='color-field'>Hit Flash 2
+          <input id='cFlashB_sw' class='sw' type='color'><input id='cFlashB' class='hex' type='text' value='#660000'>
+        </label>
+        <label class='color-field'>Successful Split
+          <input id='cPZBg_sw' class='sw' type='color'><input id='cPZBg' class='hex' type='text' value='#157515'>
+        </label>
+        <label class='color-field'>Success Text
+          <input id='cPZText_sw' class='sw' type='color'><input id='cPZText' class='hex' type='text' value='#EAE6CA'>
+        </label>
+        <label class='color-field'>Footer Background
+          <input id='cFootBg_sw' class='sw' type='color'><input id='cFootBg' class='hex' type='text' value='#111'>
+        </label>
+        <label class='color-field'>Footer Text
+          <input id='cFootText_sw' class='sw' type='color'><input id='cFootText' class='hex' type='text' value='#FDB515'>
+        </label>
+      </div>
+
+      <div style='margin-top:10px'><button id='btnApplyFlags'>Apply Settings</button></div>
+
+      <h2 style='margin-top:14px'>Personal Best</h2>
+      <div class='row' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>
+        <label><input id='pbOnlyBetter' type='checkbox'> Only if better</label>
+        <button id='btnSavePB'>Save PB</button>
+      </div>
+
+      <h2 style='margin-top:14px'>Run Timer</h2>
+      <div class='row' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>
+        <button id='btnTimerStart'>Start</button>
+        <button id='btnTimerStop'>Stop</button>
+        <button id='btnTimerReset'>Reset</button>
+        <span id='timerPreview' class='pill'>00:00.00</span>
+      </div>
+
+      <div id='overlayPaths' class='muted' style='margin-top:10px'>
+        <div>Overlay files:</div>
+        <code id='pathHtml'></code><code id='pathCss'></code><code id='pathConfig'></code>
+      </div>
+    </section>
+
+    <section id='secOverlayLive'>
+      <h2>Overlay Preview (live)</h2>
+      <iframe id='overlayFrame' sandbox='allow-scripts allow-same-origin'></iframe>
+      <div id='overlayNote' class='muted'>If the preview doesn’t load, your browser may block <code>file://</code> iframes.</div>
+    </section>
+
+    <section id='secSplits'>
+      <h2>Splits (edit cells or use +/−)</h2>
+      <div class='row' style='display:flex;gap:12px;align-items:center;margin-bottom:8px;flex-wrap:wrap'>
+        <label>Count <input id='splitCount' class='num' type='number' min='1' value='1'></label>
+        <button id='btnResize'>Resize</button>
+        <button id='btnApplyTable'>Apply Table to Streamer.bot</button>
+      </div>
+      <table>
+        <thead><tr><th>#</th><th>Name</th><th>Run</th><th>Boss</th><th>PB</th><th>Total</th></tr></thead>
+        <tbody id='rows'></tbody>
+      </table>
+      <div class='muted' style='margin-top:6px'>Update totals by clicking '+ or -'. Click 'Apply Table to Streamer.bot' if you edited hits or split names in the text fields.</div>
+    </section>
+
+    <section id='secThemes'>
+      <h2>Themes</h2>
+      <div class='row' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>
+        <label>Saved
+          <select id='themeList' style='min-width:220px'></select>
+        </label>
+        <label>Name
+          <input id='themeName' type='text' class='name' placeholder='New theme name'>
+        </label>
+        <label><input id='themeBackupOnSave' type='checkbox' checked> Backup on save</label>
+        <button id='btnSaveTheme'>Save</button>
+        <button id='btnLoadTheme'>Load</button>
+        <button id='btnDeleteTheme'>Delete</button>
+      </div>
+      <div class='row' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:6px'>
+        <label>Backups
+          <select id='themeBackupList' style='min-width:240px'></select>
+        </label>
+        <button id='btnRestoreTheme'>Restore from backup</button>
+      </div>
+    </section>
+
+    <section id='secProfiles'>
+      <h2>Profiles</h2>
+      <div class='row' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>
+        <label>Saved
+          <select id='profileList' style='min-width:220px'></select>
+        </label>
+        <label>Name
+          <input id='profileName' type='text' class='name' placeholder='New profile name'>
+        </label>
+        <label><input id='backupOnSave' type='checkbox' checked> Backup on save</label>
+        <button id='btnSaveProfile'>Save</button>
+        <button id='btnLoadProfile'>Load</button>
+      </div>
+      <div class='row' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:6px'>
+        <label>Backups
+          <select id='backupList' style='min-width:240px'></select>
+        </label>
+        <button id='btnRestoreBackup'>Restore from backup</button>
+      </div>
+    </section>
+
+    <section id='secJson'>
+      <h2>Export / Import JSON</h2>
+      <div class='muted' style='margin-bottom:6px'>Export reflects the last state received from Streamer.bot.</div>
+      <div style='display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:8px'>
+        <button id='btnExportJson'>Export JSON</button>
+        <button id='btnImportJson'>Import JSON</button>
+      </div>
+      <textarea id='jsonArea' spellcheck='false' style='width:100%;height:200px;background:var(--input-bg);border:1px solid var(--input-bd);color:var(--text);border-radius:8px;padding:10px;font-family:ui-monospace,Consolas,monospace'></textarea>
+    </section>
+
+    <section id='secPreviewSB'>
+      <h2>Preview (from SB)</h2>
+      <div class='muted'>Mirrors the last broadcast/export from Streamer.bot.</div>
+      <div id='livePreview' class='pill'></div>
+    </section>
+
+    <section id='secConnection'>
+      <h2>Connection</h2>
+      <div class='row' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>
+        <label>WebSocket <input id='wsUrl' type='text' value='ws://localhost:8080' style='width:260px'></label>
+        <button id='btnConnect'>Connect</button>
+        <button id='btnRefresh'>Refresh State</button>
+      </div>
+      <div id='conn' class='muted'>Disconnected</div>
+      <div id='last' class='muted'></div>
+    </section>
+  </main>
+
+  <script src='./config.js'></script>
+</body>
+</html>";
+}
+
+
+private string DefaultConfigJs()
+{
+    return @"// Hit Counter Config JS — now with timer controls
+// Required SB Actions:
+//   HC.ExportState, HC.SetFlags, HC.ApplySplitsFull,
+//   HC.SaveProfile, HC.LoadProfile, HC.RestoreBackup,
+//   HC.GoToSplitIndex, HC.RunHits, HC.BossHits,
+//   HC.SaveTheme, HC.LoadTheme, HC.DeleteTheme, HC.RestoreThemeFromBackup,
+//   HC.SaveCurrentRunAsPB,
+//   HC.TimerStart, HC.TimerStop, HC.TimerReset
+(function(){
+  'use strict';
+
+  var sock=null, WS_URL=null, lastData=null;
+  var backupsByProfile={}, backupsByTheme={};
+
+  function el(id){ return document.getElementById(id); }
+  function on(n,e,f){ if(n&&n.addEventListener) n.addEventListener(e,f); }
+  function text(n,v){ if(n) n.textContent=v; }
+  function val(n){ return n?(n.value||''):''; }
+  function isHex(s){ return /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(String(s).trim()); }
+  function clampHex(s){ s=String(s||'').trim(); if(/^#[0-9a-f]{6}$/i.test(s)||/^#[0-9a-f]{8}$/i.test(s)||/^#[0-9a-f]{3,4}$/i.test(s)) return s; return ''; }
+
+  var conn=el('conn'), last=el('last'), wsUrl=el('wsUrl');
+  var btnConnect=el('btnConnect'), btnRefresh=el('btnRefresh');
+
+  var fRun=el('fRun'), fBoss=el('fBoss'), fPB=el('fPB'), fTot=el('fTot'), fWrap=el('fWrap'), fAuto=el('fAuto');
+  var btnApplyFlags=el('btnApplyFlags');
+
+  var btnSavePB=el('btnSavePB'), pbOnlyBetter=el('pbOnlyBetter');
+
+  // Timer controls + preview
+  var btnTimerStart = el('btnTimerStart'),
+      btnTimerStop  = el('btnTimerStop'),
+      btnTimerReset = el('btnTimerReset'),
+      timerPreview  = el('timerPreview');
+  var tState={ running:false, baseMs:0, raf:0, lastPerf:0 };
+  function tFmt(ms){
+    ms=Math.max(0,Math.floor(ms));
+    var cs=Math.floor((ms%1000)/10), s=Math.floor(ms/1000)%60, m=Math.floor(ms/60000);
+    return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')+'.'+String(cs).padStart(2,'0');
+  }
+  function tTick(){
+    if(!tState.running){ tState.raf=0; return; }
+    var now=performance.now(); if(!tState.lastPerf) tState.lastPerf=now;
+    var d=now-tState.lastPerf; tState.lastPerf=now;
+    tState.baseMs+=d; if(timerPreview) timerPreview.textContent=tFmt(tState.baseMs);
+    tState.raf=requestAnimationFrame(tTick);
+  }
+  function syncTimerPreview(d){
+    var running=!!(d && d.timerRunning);
+    var ms=Math.max(0, +(d && d.timerElapsedMs) || 0);
+    tState.baseMs=ms; tState.lastPerf=performance.now();
+    if(timerPreview) timerPreview.textContent=tFmt(ms);
+    if(tState.raf){ cancelAnimationFrame(tState.raf); tState.raf=0; }
+    tState.running=running; if(running) tState.raf=requestAnimationFrame(tTick);
+  }
+
+  // Colors (hex)
+  var hitColor=el('hitColor'), normColor=el('normColor');
+  var cHeaderBg=el('cHeaderBg'), cHeaderText=el('cHeaderText'), cBorder=el('cBorder'), cBodyText=el('cBodyText');
+  var cCurOutline=el('cCurOutline'), cCurBg=el('cCurBg');
+  var cFlashA=el('cFlashA'), cFlashB=el('cFlashB');
+  var cPZBg=el('cPZBg'), cPZText=el('cPZText');
+  var cFootBg=el('cFootBg'), cFootText=el('cFootText');
+
+  // Swatches
+  var hitColor_sw=el('hitColor_sw'), normColor_sw=el('normColor_sw');
+  var cHeaderBg_sw=el('cHeaderBg_sw'), cHeaderText_sw=el('cHeaderText_sw'), cBorder_sw=el('cBorder_sw'), cBodyText_sw=el('cBodyText_sw');
+  var cCurOutline_sw=el('cCurOutline_sw'), cCurBg_sw=el('cCurBg_sw');
+  var cFlashA_sw=el('cFlashA_sw'), cFlashB_sw=el('cFlashB_sw');
+  var cPZBg_sw=el('cPZBg_sw'), cPZText_sw=el('cPZText_sw');
+  var cFootBg_sw=el('cFootBg_sw'), cFootText_sw=el('cFootText_sw');
+
+  var splitCount=el('splitCount'), rows=el('rows');
+  var btnResize=el('btnResize'), btnApplyTable=el('btnApplyTable');
+
+  var profileList=el('profileList'), profileName=el('profileName'), backupOnSave=el('backupOnSave');
+  var btnSaveProfile=el('btnSaveProfile'), btnLoadProfile=el('btnLoadProfile');
+  var backupList=el('backupList'), btnRestoreBackup=el('btnRestoreBackup');
+
+  var themeList=el('themeList'), themeName=el('themeName'), themeBackupOnSave=el('themeBackupOnSave');
+  var btnSaveTheme=el('btnSaveTheme'), btnLoadTheme=el('btnLoadTheme'), btnDeleteTheme=el('btnDeleteTheme');
+  var themeBackupList=el('themeBackupList'), btnRestoreTheme=el('btnRestoreTheme');
+
+  var livePreview=el('livePreview');
+  var pathHtml=el('pathHtml'), pathCss=el('pathCss'), pathConfig=el('pathConfig');
+  var overlayFrame=el('overlayFrame');
+
+  var jsonArea=el('jsonArea'), btnExportJson=el('btnExportJson'), btnImportJson=el('btnImportJson');
+
+  function sendRaw(obj){ try{ if(sock&&sock.readyState===1) sock.send(JSON.stringify(obj)); }catch(e){} }
+  function doAction(actionOrGuid,args){
+    var isGuid=/^[0-9a-f-]{36}$/i.test(String(actionOrGuid||'').trim());
+    sendRaw({ request:'DoAction', id:'hc-'+Math.random().toString(36).slice(2),
+      action: isGuid?{id:actionOrGuid}:{name:actionOrGuid}, args:args||{} });
+  }
+
+  var retryMs=1500;
+  function connect(){
+    try{
+      WS_URL=(val(wsUrl)||'ws://localhost:8080').trim();
+      if(sock&&sock.readyState===1){ try{sock.close();}catch(e){} }
+      sock=new WebSocket(WS_URL);
+      sock.onopen=function(){
+        text(conn,'Connected to '+WS_URL);
+        retryMs=1500;
+        sendRaw({ request:'Subscribe', id:'hc-config', events:{ General:['Custom'] }});
+        doAction('HC.ExportState');
+      };
+      sock.onclose=function(){
+        text(conn,'Disconnected — retrying...');
+        try{sock.close();}catch(e){}
+        setTimeout(connect, Math.min(retryMs,10000));
+        retryMs=Math.min(retryMs*1.5,10000);
+      };
+      sock.onerror=function(){ try{sock.close();}catch(e){} };
+      sock.onmessage=onMessage;
+    }catch(e){
+      text(conn,'Error: '+(e&&e.message||e));
+      setTimeout(connect, Math.min(retryMs,10000));
+      retryMs=Math.min(retryMs*1.5,10000);
+    }
+  }
+
+  function onMessage(ev){
+    try{
+      var msg=JSON.parse(ev.data);
+      var req=(msg && msg.data && msg.data.request) ? msg.data.request : msg.request;
+      if(req==='exportState'){
+        var d=(msg.data && msg.data.data) ? msg.data.data : {};
+        lastData=d; text(last,'Loaded: '+new Date().toLocaleTimeString());
+        applyExportToUI(d); renderPreview(d); syncTimerPreview(d);
+        return;
+      }
+      if(req==='splitStatusUpdate' || req==='Test'){
+        var d2=(msg.data && msg.data.data) ? msg.data.data : msg.data;
+        if(d2) lastData=d2;
+        text(last,'Last update: '+new Date().toLocaleTimeString());
+        renderPreview(d2||{}); syncTimerPreview(d2||{});
+        return;
+      }
+    }catch(e){}
+  }
+
+  function bindColorPair(sw,hex){
+    if(!sw||!hex) return;
+    var hv=clampHex(hex.value); if(isHex(hv)) sw.value=hv.slice(0,7);
+    on(sw, 'input', function(){ var v=String(sw.value||'').trim(); if(isHex(v)) hex.value=v; });
+    on(hex,'input',function(){ var v=clampHex(hex.value); if(isHex(v)) sw.value=v.slice(0,7); });
+  }
+  [
+    [hitColor_sw,hitColor],[normColor_sw,normColor],
+    [cHeaderBg_sw,cHeaderBg],[cHeaderText_sw,cHeaderText],[cBorder_sw,cBorder],[cBodyText_sw,cBodyText],
+    [cCurOutline_sw,cCurOutline],[cCurBg_sw,cCurBg],
+    [cFlashA_sw,cFlashA],[cFlashB_sw,cFlashB],
+    [cPZBg_sw,cPZBg],[cPZText_sw,cPZText],
+    [cFootBg_sw,cFootBg],[cFootText_sw,cFootText]
+  ].forEach(function(p){ bindColorPair(p[0],p[1]); });
+
+  function clearRows(){ if(!rows) return; while(rows.firstChild) rows.removeChild(rows.firstChild); }
+  function makeInput(cls,val0,type){ var i=document.createElement('input'); i.type=type||'text'; i.className=cls; i.value=(val0==null)?'':String(val0); return i; }
+
+  function addRow(i,data){
+    if(!rows) return;
+    var tr=document.createElement('tr');
+
+    var tdIdx=document.createElement('td'); tdIdx.textContent=String(i); tr.appendChild(tdIdx);
+
+    var tdName=document.createElement('td');
+    var inName=makeInput('name',(data&&data.name)||('Split '+i),'text'); inName.dataset.idx=i; inName.dataset.field='name';
+    tdName.appendChild(inName); tr.appendChild(tdName);
+
+    var tdRun=document.createElement('td');
+    var inRun=makeInput('num',(data&&data.runHits)||0,'number'); inRun.min='0'; inRun.step='1'; inRun.dataset.idx=i; inRun.dataset.field='run';
+    var btnRminus=document.createElement('button'); btnRminus.className='mini'; btnRminus.textContent='−';
+    var btnRplus=document.createElement('button');  btnRplus.className='mini';  btnRplus.textContent='+';
+    btnRminus.onclick=function(){ bump(i,'run',-1,inRun); };
+    btnRplus.onclick=function(){ bump(i,'run',+1,inRun); };
+    tdRun.appendChild(inRun); tdRun.appendChild(btnRminus); tdRun.appendChild(btnRplus);
+    tr.appendChild(tdRun);
+
+    var tdBoss=document.createElement('td');
+    var inBoss=makeInput('num',(data&&data.bossHits)||0,'number'); inBoss.min='0'; inBoss.step='1'; inBoss.dataset.idx=i; inBoss.dataset.field='boss';
+    var btnBminus=document.createElement('button'); btnBminus.className='mini'; btnBminus.textContent='−';
+    var btnBplus=document.createElement('button');  btnBplus.className='mini';  btnBplus.textContent='+';
+    btnBminus.onclick=function(){ bump(i,'boss',-1,inBoss); };
+    btnBplus.onclick=function(){ bump(i,'boss',+1,inBoss); };
+    tdBoss.appendChild(inBoss); tdBoss.appendChild(btnBminus); tdBoss.appendChild(btnBplus);
+    tr.appendChild(tdBoss);
+
+    var tdPB=document.createElement('td');
+    var inPB=makeInput('num',(data&&data.pb)||0,'number'); inPB.min='0'; inPB.step='1'; inPB.dataset.idx=i; inPB.dataset.field='pb';
+    tdPB.appendChild(inPB); tr.appendChild(tdPB);
+
+    var tdTot=document.createElement('td');
+    var inTot=makeInput('num',(data&&data.total)!=null?data.total:((data&&data.runHits||0)+(data&&data.bossHits||0)),'number');
+    inTot.readOnly=true; inTot.tabIndex=-1; inTot.dataset.idx=i; inTot.dataset.field='total';
+    tdTot.appendChild(inTot); tr.appendChild(tdTot);
+
+    function recalc(){ var r=+inRun.value||0, b=+inBoss.value||0; inTot.value=String(r+b); }
+    on(inRun,'input',recalc); on(inBoss,'input',recalc);
+
+    rows.appendChild(tr);
+  }
+
+  function bump(idx, kind, delta, inputRef){
+    // keep the best-effort split switch (optional)
+    doAction('HC.GoToSplitIndex', { index: idx });
+
+    // but also send the index with the hit so it ALWAYS applies to the right row
+    const args = { change: delta, index: idx };
+    if (kind === 'run')  doAction('HC.RunHits',  args);
+    else                 doAction('HC.BossHits', args);
+
+    // local UI update
+    var v = parseInt(inputRef.value,10)||0; v = Math.max(0, v+delta); inputRef.value = String(v);
+    var tr  = inputRef.closest('tr');
+    var r   = tr.querySelector('input[data-field=run]');
+    var b   = tr.querySelector('input[data-field=boss]');
+    var tot = tr.querySelector('input[data-field=total]');
+    tot.value = String((parseInt(r.value,10)||0) + (parseInt(b.value,10)||0));
+
+    setTimeout(function(){ doAction('HC.ExportState'); }, 200);
+  }
+
+  function rebuildProfileUI(profiles, active){
+    if(!profileList) return;
+    while(profileList.firstChild) profileList.removeChild(profileList.firstChild);
+
+    var opt0=document.createElement('option');
+    opt0.value=''; opt0.textContent='— select —';
+    profileList.appendChild(opt0);
+
+    (profiles||[]).forEach(function(name){
+      var o=document.createElement('option');
+      o.value=name; o.textContent=name;
+      if(active && name.toLowerCase()===String(active).toLowerCase()) o.selected=true;
+      profileList.appendChild(o);
+    });
+
+    if(profileName && !profileName.value && active) profileName.value=active;
+    rebuildBackupsDropdown();
+  }
+
+  function rebuildBackupsDropdown(){
+    if(!backupList) return;
+    while(backupList.firstChild) backupList.removeChild(backupList.firstChild);
+
+    var sel=(profileList && profileList.value) || (profileName && profileName.value) || '';
+    var files=(backupsByProfile && backupsByProfile[sel]) || [];
+
+    if(!files.length){
+      var o=document.createElement('option');
+      o.value=''; o.textContent='(no backups found)';
+      o.disabled=true; o.selected=true;
+      backupList.appendChild(o);
+      return;
+    }
+
+    files.forEach(function(file){
+      var o=document.createElement('option');
+      o.value=file; o.textContent=file;
+      backupList.appendChild(o);
+    });
+  }
+
+  function rebuildThemeUI(themes, active){
+    if(!themeList) return;
+    while(themeList.firstChild) themeList.removeChild(themeList.firstChild);
+
+    var opt0=document.createElement('option');
+    opt0.value=''; opt0.textContent='— select —';
+    themeList.appendChild(opt0);
+
+    (themes||[]).forEach(function(name){
+      var o=document.createElement('option');
+      o.value=name; o.textContent=name;
+      if(active && name.toLowerCase()===String(active).toLowerCase()) o.selected=true;
+      themeList.appendChild(o);
+    });
+
+    if(themeName && !themeName.value && active) themeName.value=active;
+    rebuildThemeBackupsDropdown();
+  }
+
+  function rebuildThemeBackupsDropdown(){
+    if(!themeBackupList) return;
+    while(themeBackupList.firstChild) themeBackupList.removeChild(themeBackupList.firstChild);
+
+    var sel=(themeList && themeList.value) || (themeName && themeName.value) || '';
+    var files=(backupsByTheme && backupsByTheme[sel]) || [];
+
+    if(!files.length){
+      var o=document.createElement('option');
+      o.value=''; o.textContent='(no backups found)';
+      o.disabled=true; o.selected=true;
+      themeBackupList.appendChild(o);
+      return;
+    }
+
+    files.forEach(function(file){
+      var o=document.createElement('option');
+      o.value=file; o.textContent=file;
+      themeBackupList.appendChild(o);
+    });
+  }
+
+  function applyExportToUI(d){
+    if(fRun) fRun.checked=!!d.showRunHits;
+    if(fBoss) fBoss.checked=!!d.showBossHits;
+    if(fPB) fPB.checked=!!d.showPB;
+    if(fTot) fTot.checked=!!d.showSplitTotal;
+    if(fWrap) fWrap.checked=!!d.wrapNavigation;
+    if(fAuto) fAuto.checked=!!d.autoBroadcast;
+
+    function setPair(sw,hx,val){ if(typeof val==='string'){ hx.value=val; if(isHex(val)) sw.value=val.slice(0,7); } }
+    setPair(hitColor_sw, hitColor, d.hitColor);
+    setPair(normColor_sw, normColor, d.normalColor);
+    setPair(cHeaderBg_sw, cHeaderBg, d.headerBgColor);
+    setPair(cHeaderText_sw, cHeaderText, d.headerTextColor);
+    setPair(cBorder_sw, cBorder, d.borderColor);
+    setPair(cBodyText_sw, cBodyText, d.bodyTextColor);
+    setPair(cCurOutline_sw, cCurOutline, d.currentOutlineColor);
+    setPair(cCurBg_sw, cCurBg, d.currentBgColor);
+    setPair(cFlashA_sw, cFlashA, d.flashStartColor);
+    setPair(cFlashB_sw, cFlashB, d.flashMidColor);
+    setPair(cPZBg_sw, cPZBg, d.pastZeroBgColor);
+    setPair(cPZText_sw, cPZText, d.pastZeroTextColor);
+    setPair(cFootBg_sw, cFootBg, d.footerBgColor);
+    setPair(cFootText_sw, cFootText, d.footerTextColor);
+
+    if(pathHtml && d.overlayHtmlPath) text(pathHtml,d.overlayHtmlPath);
+    if(pathCss && d.overlayCssPath) text(pathCss,d.overlayCssPath);
+    if(pathConfig && d.configHtmlPath) text(pathConfig,d.configHtmlPath);
+    if(overlayFrame && d.overlayPath && overlayFrame.src!==d.overlayPath) overlayFrame.src=d.overlayPath;
+
+    var list=d.splits||[];
+    if(splitCount) splitCount.value=String(d.splitCount>0?d.splitCount:list.length||1);
+    clearRows();
+    var cnt=parseInt(splitCount ? splitCount.value : (d.splitCount||1),10)||1;
+    for(var i=1;i<=cnt;i++) addRow(i, list[i-1]||{});
+
+    backupsByProfile = d.profileBackups || {}; rebuildProfileUI(d.profiles||[], d.activeProfile||'');
+    backupsByTheme   = d.themeBackups   || {}; rebuildThemeUI(d.themes||[],   d.activeTheme||'');
+  }
+
+  function readTableArgs(){
+    var cnt=parseInt(splitCount ? splitCount.value : '1',10)||1;
+    var args={ splitCount:cnt, updateTotalPB:false };
+    if(!rows) return args;
+    var inputs=rows.querySelectorAll('input');
+    for(var n=0;n<inputs.length;n++){
+      var inp=inputs[n]; var idx=inp.dataset.idx; var field=inp.dataset.field; if(!idx||!field) continue;
+      if(field==='name') args['split_'+idx+'_name']=inp.value.trim();
+      else if(field==='run')  args['split_'+idx+'_run']=Math.max(0, parseInt(inp.value,10)||0);
+      else if(field==='boss') args['split_'+idx+'_boss']=Math.max(0, parseInt(inp.value,10)||0);
+      else if(field==='pb')   args['split_'+idx+'_pb']=Math.max(0, parseInt(inp.value,10)||0);
+    }
+    return args;
+  }
+
+  function renderPreview(d){
+    if(!livePreview) return;
+    text(livePreview,'Splits: '+(d.splits?d.splits.length:0)+
+      ' | Total Hits: '+(d.totalHits||0)+
+      ' | PB: '+(d.currentPB||0)+
+      ' | Hits to PB: '+(d.hitsToPB||0));
+  }
+
+  on(btnExportJson,'click',function(){
+    if(!lastData){ doAction('HC.ExportState'); setTimeout(function(){ if(lastData&&jsonArea) jsonArea.value=JSON.stringify(lastData,null,2); }, 300); return; }
+    if(jsonArea) jsonArea.value=JSON.stringify(lastData,null,2);
+  });
+
+  on(btnImportJson,'click',function(){
+    if(!jsonArea) return;
+    var raw=String(jsonArea.value||'').trim(); if(!raw){ alert('Paste JSON first.'); return; }
+    var d=null; try{ d=JSON.parse(raw); }catch(e){ alert('Invalid JSON.'); return; }
+
+    var argsFlags={
+      showRunHits: !!d.showRunHits, showBossHits: !!d.showBossHits, showPB: !!d.showPB, showSplitTotal: !!d.showSplitTotal,
+      wrapNavigation: !!d.wrapNavigation, autoBroadcast: !!d.autoBroadcast
+    };
+    doAction('HC.SetFlags', argsFlags);
+
+    var theme={
+      hitColor:d.hitColor, normalColor:d.normalColor, headerBgColor:d.headerBgColor, headerTextColor:d.headerTextColor,
+      borderColor:d.borderColor, bodyTextColor:d.bodyTextColor, currentOutlineColor:d.currentOutlineColor, currentBgColor:d.currentBgColor,
+      flashStartColor:d.flashStartColor, flashMidColor:d.flashMidColor, pastZeroBgColor:d.pastZeroBgColor, pastZeroTextColor:d.pastZeroTextColor,
+      footerBgColor:d.footerBgColor, footerTextColor:d.footerTextColor
+    };
+    setTimeout(function(){ doAction('HC.SetFlags', { themeJson: JSON.stringify(theme) }); }, 150);
+
+    var list=d.splits||[]; var args=readTableArgs();
+    if(Array.isArray(list) && list.length){
+      args={ splitCount:list.length, updateTotalPB:false };
+      for(var i=0;i<list.length;i++){
+        var idx=i+1, s=list[i]||{};
+        args['split_'+idx+'_name']=String(s.name||('Split '+idx));
+        args['split_'+idx+'_run']=Math.max(0,parseInt(s.runHits,10)||0);
+        args['split_'+idx+'_boss']=Math.max(0,parseInt(s.bossHits,10)||0);
+        args['split_'+idx+'_pb']=Math.max(0,parseInt(s.pb,10)||0);
+      }
+      doAction('HC.ApplySplitsFull', args);
+    }
+    setTimeout(function(){ doAction('HC.ExportState'); }, 350);
+  });
+
+  on(btnConnect,'click',connect);
+  on(btnRefresh,'click',function(){ doAction('HC.ExportState'); });
+
+  on(btnApplyFlags,'click',function(){
+    var argsFlags={
+      showRunHits: !!(fRun&&fRun.checked), showBossHits: !!(fBoss&&fBoss.checked), showPB: !!(fPB&&fPB.checked),
+      showSplitTotal: !!(fTot&&fTot.checked), wrapNavigation: !!(fWrap&&fWrap.checked), autoBroadcast: !!(fAuto&&fAuto.checked)
+    };
+    doAction('HC.SetFlags', argsFlags);
+
+    function v(n){ return (n && n.value || '').trim(); }
+    var theme={ hitColor:v(hitColor), normalColor:v(normColor), headerBgColor:v(cHeaderBg), headerTextColor:v(cHeaderText),
+      borderColor:v(cBorder), bodyTextColor:v(cBodyText), currentOutlineColor:v(cCurOutline), currentBgColor:v(cCurBg),
+      flashStartColor:v(cFlashA), flashMidColor:v(cFlashB), pastZeroBgColor:v(cPZBg), pastZeroTextColor:v(cPZText),
+      footerBgColor:v(cFootBg), footerTextColor:v(cFootText) };
+    setTimeout(function(){ doAction('HC.SetFlags', { themeJson: JSON.stringify(theme) }); }, 150);
+    setTimeout(function(){ doAction('HC.ExportState'); }, 300);
+  });
+
+  // PB button
+  on(btnSavePB,'click',function(){
+    var only=!!(pbOnlyBetter && pbOnlyBetter.checked);
+    doAction('HC.SaveCurrentRunAsPB', { onlyIfBetter: only });
+    setTimeout(function(){ doAction('HC.ExportState'); }, 200);
+  });
+
+  // Timer buttons
+  on(btnTimerStart,'click',function(){ doAction('HC.TimerStart'); setTimeout(function(){ doAction('HC.ExportState'); }, 150); });
+  on(btnTimerStop ,'click',function(){ doAction('HC.TimerStop');  setTimeout(function(){ doAction('HC.ExportState'); }, 150); });
+  on(btnTimerReset,'click',function(){ doAction('HC.TimerReset'); setTimeout(function(){ doAction('HC.ExportState'); }, 150); });
+
+  on(btnResize,'click',function(){
+    if(!rows || !splitCount) return;
+    var cnt=parseInt(splitCount.value,10)||1;
+    var snapshot=[], r=rows.querySelectorAll('tr');
+    for(var i=0;i<r.length;i++){
+      var tr=r[i], rowIdx=i+1;
+      snapshot.push({
+        name:(tr.querySelector('input[data-field=name]')||{}).value||('Split '+rowIdx),
+        runHits:parseInt((tr.querySelector('input[data-field=run]')||{}).value,10)||0,
+        bossHits:parseInt((tr.querySelector('input[data-field=boss]')||{}).value,10)||0,
+        pb:parseInt((tr.querySelector('input[data-field=pb]')||{}).value,10)||0
+      });
+    }
+    clearRows(); for(var j=1;j<=cnt;j++) addRow(j, snapshot[j-1]||{});
+  });
+
+  on(btnApplyTable,'click',function(){
+    var args=readTableArgs(); args.updateTotalPB=false;
+    doAction('HC.ApplySplitsFull', args);
+    setTimeout(function(){ doAction('HC.ExportState'); },200);
+  });
+
+  on(btnSaveProfile,'click',function(){
+    var name=(profileName && profileName.value || '').trim(); if(!name){ alert('Enter a profile name'); return; }
+    doAction('HC.SaveProfile',{ profileName:name, backupIfExists: !!(backupOnSave && backupOnSave.checked) });
+    setTimeout(function(){ doAction('HC.ExportState'); },200);
+  });
+
+  on(btnLoadProfile,'click',function(){
+    var name=((profileList&&profileList.value)||(profileName&&profileName.value)||'').trim();
+    if(!name){ alert('Choose or enter a profile'); return; }
+    doAction('HC.LoadProfile',{ profileName:name });
+    setTimeout(function(){ doAction('HC.ExportState'); },200);
+  });
+
+  on(profileList,'change',rebuildBackupsDropdown);
+
+  on(btnSaveTheme,'click',function(){
+    var name=(themeName&&themeName.value||'').trim(); if(!name){ alert('Enter a theme name'); return; }
+    doAction('HC.SaveTheme',{ themeName:name, backupIfExists: !!(themeBackupOnSave && themeBackupOnSave.checked) });
+    setTimeout(function(){ doAction('HC.ExportState'); },200);
+  });
+  on(btnLoadTheme,'click',function(){
+    var name=((themeList&&themeList.value)||(themeName&&themeName.value)||'').trim();
+    if(!name){ alert('Choose or enter a theme'); return; }
+    doAction('HC.LoadTheme',{ themeName:name });
+    setTimeout(function(){ doAction('HC.ExportState'); },200);
+  });
+  on(btnDeleteTheme,'click',function(){
+    var name=((themeList&&themeList.value)||(themeName&&themeName.value)||'').trim();
+    if(!name){ alert('Choose or enter a theme'); return; }
+    if(!confirm('Delete theme “'+name+'”?')) return;
+    doAction('HC.DeleteTheme',{ themeName:name });
+    setTimeout(function(){ doAction('HC.ExportState'); },250);
+  });
+  on(btnRestoreTheme,'click',function(){
+    var name=((themeList&&themeList.value)||(themeName&&themeName.value)||'').trim();
+    if(!name){ alert('Choose a theme first'); return; }
+    var file=(themeBackupList && themeBackupList.value) || '';
+    if(!file || file.indexOf('.bak.json')<0){ alert('Choose a backup file'); return; }
+    doAction('HC.RestoreThemeFromBackup',{ themeName:name, backupFile:file });
+    setTimeout(function(){ doAction('HC.ExportState'); },250);
+  });
+
+  on(btnRestoreBackup,'click',function(){
+    var prof=((profileList&&profileList.value)||(profileName&&profileName.value)||'').trim();
+    if(!prof){ alert('Choose a profile first'); return; }
+    var file=(backupList && backupList.value) || '';
+    if(!file || file.indexOf('.bak.json')<0){ alert('Choose a backup file'); return; }
+    doAction('HC.RestoreBackup',{ profileName:prof, backupFile:file });
+    setTimeout(function(){ doAction('HC.ExportState'); },250);
+  });
+
+  // Theme backups drop-down should refresh when the theme selection changes
+  on(themeList,'change',rebuildThemeBackupsDropdown);
+
+  window.addEventListener('load', connect);
+})();";
+}
+
+
+    // Create/update splits from DoAction args.
+public bool applySplitsFullFromArgs()
+{
+    // 1) Try compact array first: splitsJson: [{name,runHits,bossHits,pb}, ...]
+    List<(string name,int run,int boss,int pb)> rows = null;
+    if (CPH.TryGetArg<string>("splitsJson", out var sjson) && !string.IsNullOrWhiteSpace(sjson))
+    {
+        try
+        {
+            var arr = Newtonsoft.Json.Linq.JArray.Parse(sjson);
+            rows = new List<(string,int,int,int)>(arr.Count);
+            foreach (var t in arr)
+            {
+                string name = (t["name"]?.ToString() ?? "").Trim();
+                int run  = Math.Max(0, (int?)t["runHits"]  ?? 0);
+                int boss = Math.Max(0, (int?)t["bossHits"] ?? 0);
+                int pb   = Math.Max(0, (int?)t["pb"]       ?? 0);
+                if (string.IsNullOrEmpty(name)) name = $"Split {rows.Count+1}";
+                rows.Add((name, run, boss, pb));
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"applySplitsFullFromArgs: splitsJson parse failed: {ex.Message}");
+        }
+    }
+
+    // 2) Legacy per-field args as fallback
+    int countArg = 0;
+    CPH.TryGetArg<int>("splitCount", out countArg);
+
+    if (rows == null)
+    {
+        if (countArg < 1)
+        {
+            CPH.LogWarn("applySplitsFullFromArgs: missing/invalid splitCount and no splitsJson.");
+            return false;
+        }
+        rows = new List<(string,int,int,int)>(countArg);
+        for (int i = 1; i <= countArg; i++)
+        {
+            string name = null;
+            if (!CPH.TryGetArg<string>($"split_{i}_name", out name) || string.IsNullOrWhiteSpace(name))
+                name = GetString($"Split_{i}", $"Split {i}", true);
+
+            int run  = GetInt($"currentrunHits_Split_{i}", 0, true);
+            int boss = GetInt($"currentbossHits_Split_{i}", 0, true);
+            int pb   = GetInt($"currentsplitPB_Split_{i}", 0, true);
+
+            if (CPH.TryGetArg<int>($"split_{i}_run", out var runArg))  run  = Math.Max(0, runArg);
+            if (CPH.TryGetArg<int>($"split_{i}_boss", out var bossArg)) boss = Math.Max(0, bossArg);
+            if (CPH.TryGetArg<int>($"split_{i}_pb", out var pbArg))     pb   = Math.Max(0, pbArg);
+
+            rows.Add((name.Trim(), run, boss, pb));
+        }
+    }
+
+    var count = rows.Count;
+    bool updateTotalPB = false;
+    CPH.TryGetArg<bool>("updateTotalPB", out updateTotalPB);
+
+    CPH.SetGlobalVar("Split_Count", count, true);
+
+    int totalRun = 0, totalBoss = 0, totalPB = 0;
+    var names = new List<string>(count);
+
+    for (int i = 1; i <= count; i++)
+    {
+        var (name, run, boss, pb) = rows[i-1];
+        string id = $"Split_{i}";
+
+        SetString(id, name, true);
+        names.Add(name);
+
+        SetInt($"currentrunHits_{id}",  run,  true);
+        SetInt($"currentbossHits_{id}", boss, true);
+        SetInt($"currentsplitPB_{id}",  pb,   true);
+
+        totalRun  += run;
+        totalBoss += boss;
+        totalPB   += pb;
+    }
+
+    SetString("split_list", string.Join(", ", names), true);
+    SetInt("totalrunHits", totalRun, true);
+    SetInt("totalbossHits", totalBoss, true);
+    if (updateTotalPB) SetInt("currentPB", totalPB, true);
+
+    int currentSplit = GetInt("currentSplit", 1, true);
+    if (currentSplit < 1 || currentSplit > count) SetInt("currentSplit", 1, true);
+
+    broadcastSplitData();
+    return true;
+}
+
+    // Broadcast the full current state so the browser UI can initialize itself.
+public bool exportState()
+{
+    int splitCount = CPH.GetGlobalVar<int?>("Split_Count", true) ?? 0;
+    var splits = new List<Dictionary<string, object>>();
+    int totalHits = 0;
+    for (int i = 1; i <= splitCount; i++)
+    {
+        string id = $"Split_{i}";
+        string name = CPH.GetGlobalVar<string>(id, true) ?? $"Split {i}";
+        int run = CPH.GetGlobalVar<int?>($"currentrunHits_{id}", true) ?? 0;
+        int boss = CPH.GetGlobalVar<int?>($"currentbossHits_{id}", true) ?? 0;
+        int pb = CPH.GetGlobalVar<int?>($"currentsplitPB_{id}", true) ?? 0;
+        int tot = run + boss; totalHits += tot;
+        splits.Add(new Dictionary<string, object> { ["name"]=name, ["runHits"]=run, ["bossHits"]=boss, ["pb"]=pb, ["total"]=tot });
+    }
+
+    int currentPB = CPH.GetGlobalVar<int?>("currentPB", true) ?? 0;
+    int currentSplitIndex = CPH.GetGlobalVar<int?>("currentSplit", true) ?? 1;
+    bool showRunHits = CPH.GetGlobalVar<bool?>("showRunHits", true) ?? true;
+    bool showBossHits = CPH.GetGlobalVar<bool?>("showBossHits", true) ?? true;
+    bool showPB = CPH.GetGlobalVar<bool?>("showPB", true) ?? true;
+    bool showSplitTotal = CPH.GetGlobalVar<bool?>("showSplitTotal", true) ?? true;
+    bool wrapNavigation = CPH.GetGlobalVar<bool?>("wrapNavigation", true) ?? true;
+    bool autoBroadcast = CPH.GetGlobalVar<bool?>("autoBroadcast", true) ?? true;
+
+    string hitColor = CPH.GetGlobalVar<string>("hitColor", true) ?? "#ff0000";
+    string normalColor = CPH.GetGlobalVar<string>("normalColor", true) ?? "#00000000";
+    string bodyTextColor = CPH.GetGlobalVar<string>("bodyTextColor", true) ?? "#EAE6CA";
+    string headerBgColor = CPH.GetGlobalVar<string>("headerBgColor", true) ?? "#111";
+    string headerTextColor = CPH.GetGlobalVar<string>("headerTextColor", true) ?? "#FDB515";
+    string borderColor = CPH.GetGlobalVar<string>("borderColor", true) ?? "#777";
+    string currentOutlineColor = CPH.GetGlobalVar<string>("currentOutlineColor", true) ?? "#FDB515";
+    string currentBgColor = CPH.GetGlobalVar<string>("currentBgColor", true) ?? "#003344";
+    string flashStartColor = CPH.GetGlobalVar<string>("flashStartColor", true) ?? "#ff0000";
+    string flashMidColor = CPH.GetGlobalVar<string>("flashMidColor", true) ?? "#660000";
+    string pastZeroBgColor = CPH.GetGlobalVar<string>("pastZeroBgColor", true) ?? "#157515";
+    string pastZeroTextColor = CPH.GetGlobalVar<string>("pastZeroTextColor", true) ?? "#EAE6CA";
+    string footerBgColor = CPH.GetGlobalVar<string>("footerBgColor", true) ?? "#111";
+    string footerTextColor = CPH.GetGlobalVar<string>("footerTextColor", true) ?? "#FDB515";
+
+    // --- Timer fields ---
+    bool timerRunning = GetBool("timerRunning", false, true);
+    double baseSec = GetDouble("timerElapsedBeforeSec", 0, true);
+    double startSec = GetDouble("timerStartSec", 0, true);
+    double now = NowSec();
+    double elapsedSec = baseSec + (timerRunning ? Math.Max(0, now - startSec) : 0);
+    long elapsedMs = (long)Math.Round(elapsedSec * 1000.0);
+
+    // Profiles + themes (unchanged, omitted here for brevity) ...
+    // (Use your existing code to build profiles, backups, themes, and paths)
+
+    // --- BEGIN unchanged block from your version to compute profiles/themes/paths ---
+    string activeProfile = GetString("activeProfile", "", true);
+    var profiles = new List<string>();
+    string profilesDir = "";
+    try {
+        profilesDir = ProfilesRoot();
+        if (Directory.Exists(profilesDir)) {
+            foreach (var f in Directory.GetFiles(profilesDir, "*.json", SearchOption.TopDirectoryOnly)) {
+                var file = Path.GetFileName(f);
+                if (file.EndsWith(".bak.json", StringComparison.OrdinalIgnoreCase)) continue;
+                profiles.Add(Path.GetFileNameWithoutExtension(file));
+            }
+            profiles.Sort(StringComparer.OrdinalIgnoreCase);
+        }
+    } catch (Exception ex) { CPH.LogWarn($"exportState: failed to list profiles: {ex.Message}"); }
+    var backupsByProfile = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+    try {
+        if (!string.IsNullOrEmpty(profilesDir) && Directory.Exists(profilesDir)) {
+            foreach (var f in Directory.GetFiles(profilesDir, "*.bak.json", SearchOption.TopDirectoryOnly)) {
+                var fileName = Path.GetFileName(f);
+                var noExt = Path.GetFileNameWithoutExtension(fileName);
+                if (noExt.EndsWith(".bak", StringComparison.OrdinalIgnoreCase)) noExt = noExt.Substring(0, noExt.Length - 4);
+                var baseProfile = StripTimestampKey(noExt);
+                if (!backupsByProfile.TryGetValue(baseProfile, out var list)) { list = new List<string>(); backupsByProfile[baseProfile]=list; }
+                list.Add(fileName);
+            }
+            foreach (var kv in backupsByProfile) kv.Value.Sort(StringComparer.OrdinalIgnoreCase);
+        }
+    } catch (Exception ex) { CPH.LogWarn($"exportState: backups scan failed: {ex.Message}"); }
+
+    string activeTheme = ActiveTheme;
+    var themes = new List<string>();
+    string themesDir = "";
+    try {
+        themesDir = ThemesRoot();
+        if (Directory.Exists(themesDir)) {
+            foreach (var f in Directory.GetFiles(themesDir, "*.json", SearchOption.TopDirectoryOnly)) {
+                var file = Path.GetFileName(f);
+                if (file.EndsWith(".bak.json", StringComparison.OrdinalIgnoreCase)) continue;
+                themes.Add(Path.GetFileNameWithoutExtension(file));
+            }
+            themes.Sort(StringComparer.OrdinalIgnoreCase);
+        }
+    } catch (Exception ex) { CPH.LogWarn($"exportState: failed to list themes: {ex.Message}"); }
+    var backupsByTheme = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+    try {
+        if (!string.IsNullOrEmpty(themesDir) && Directory.Exists(themesDir)) {
+            foreach (var f in Directory.GetFiles(themesDir, "*.bak.json", SearchOption.TopDirectoryOnly)) {
+                var fileName = Path.GetFileName(f);
+                var noExt = Path.GetFileNameWithoutExtension(fileName);
+                if (noExt.EndsWith(".bak", StringComparison.OrdinalIgnoreCase)) noExt = noExt.Substring(0, noExt.Length - 4);
+                var baseTheme = StripTimestampKey(noExt);
+                if (!backupsByTheme.TryGetValue(baseTheme, out var list)) { list = new List<string>(); backupsByTheme[baseTheme]=list; }
+                list.Add(fileName);
+            }
+            foreach (var kv in backupsByTheme) kv.Value.Sort(StringComparer.OrdinalIgnoreCase);
+        }
+    } catch (Exception ex) { CPH.LogWarn($"exportState: theme backups scan failed: {ex.Message}"); }
+
+    string overlayRoot = "", overlayHtmlPath = "", overlayCssPath = "", configHtmlPath = "";
+    try {
+        overlayRoot = OverlayRoot();
+        overlayHtmlPath = OverlayHtmlPath();
+        overlayCssPath = OverlayCssPath();
+        configHtmlPath = ConfigHtmlPath();
+    } catch (Exception ex) { CPH.LogWarn($"exportState: overlay paths error: {ex.Message}"); }
+    // --- END unchanged block ---
+
+    var data = new Dictionary<string, object>
+    {
+        ["splits"] = splits,
+        ["splitCount"] = splitCount,
+        ["totalHits"] = totalHits,
+        ["currentPB"] = currentPB,
+        ["hitsToPB"] = currentPB - totalHits,
+        ["currentSplitIndex"] = currentSplitIndex,
+
+        ["showRunHits"] = showRunHits,
+        ["showBossHits"] = showBossHits,
+        ["showPB"] = showPB,
+        ["showSplitTotal"] = showSplitTotal,
+        ["wrapNavigation"] = wrapNavigation,
+        ["autoBroadcast"] = autoBroadcast,
+
+        ["hitColor"] = hitColor,
+        ["normalColor"] = normalColor,
+        ["bodyTextColor"] = bodyTextColor,
+        ["headerBgColor"] = headerBgColor,
+        ["headerTextColor"] = headerTextColor,
+        ["borderColor"] = borderColor,
+        ["currentOutlineColor"] = currentOutlineColor,
+        ["currentBgColor"] = currentBgColor,
+        ["flashStartColor"] = flashStartColor,
+        ["flashMidColor"] = flashMidColor,
+        ["pastZeroBgColor"] = pastZeroBgColor,
+        ["pastZeroTextColor"] = pastZeroTextColor,
+        ["footerBgColor"] = footerBgColor,
+        ["footerTextColor"] = footerTextColor,
+
+        // profiles/themes
+        ["activeProfile"] = activeProfile,
+        ["profiles"] = profiles,
+        ["profileBackups"] = backupsByProfile,
+        ["activeTheme"] = activeTheme,
+        ["themes"] = themes,
+        ["themeBackups"] = backupsByTheme,
+
+        // paths
+        ["overlayRoot"] = overlayRoot,
+        ["overlayHtmlPath"] = overlayHtmlPath,
+        ["overlayCssPath"] = overlayCssPath,
+        ["configHtmlPath"] = configHtmlPath,
+        ["overlayPath"] = !string.IsNullOrEmpty(overlayHtmlPath) ? new Uri(overlayHtmlPath).AbsoluteUri : "",
+
+        // --- Timer payload ---
+        ["timerRunning"] = timerRunning,
+        ["timerElapsedMs"] = elapsedMs
+    };
+
+    var payload = new Dictionary<string, object> { ["request"]="exportState", ["data"]=data };
+    string json = Newtonsoft.Json.JsonConvert.SerializeObject(payload);
+    CPH.WebsocketBroadcastJson(json);
+    CPH.LogInfo("exportState broadcast sent (with timer).");
+    return true;
+}
+
+    // Create/update splits with full per-row data from the browser UI.
+   
+    // Restore a profile's main JSON from one of its backups, then load it.
+    public bool restoreProfileFromBackup()
+    {
+        if (!CPH.TryGetArg<string>("profileName", out var profileName) || string.IsNullOrWhiteSpace(profileName))
+        {
+            CPH.LogWarn("restoreProfileFromBackup: missing profileName");
+            return false;
+        }
+
+        var root = ProfilesRoot();
+        var safe = SanitizeFileName(profileName);
+        string src = null;
+        if (CPH.TryGetArg<string>("backupFile", out var backupFile) && !string.IsNullOrWhiteSpace(backupFile))
+        {
+            var candidate = System.IO.Path.Combine(root, backupFile);
+            if (System.IO.File.Exists(candidate))
+                src = candidate;
+        }
+        else if (CPH.TryGetArg<string>("timestamp", out var ts) && !string.IsNullOrWhiteSpace(ts))
+        {
+            var candidate = System.IO.Path.Combine(root, $"{safe}_{ts}.bak.json");
+            if (System.IO.File.Exists(candidate))
+                src = candidate;
+        }
+        else
+        {
+            var prefix = $"{safe}_";
+            var files = System.IO.Directory.GetFiles(root, $"{prefix}*.bak.json", System.IO.SearchOption.TopDirectoryOnly);
+            System.DateTime latestT = System.DateTime.MinValue;
+            foreach (var f in files)
+            {
+                var t = System.IO.File.GetLastWriteTimeUtc(f);
+                if (t > latestT)
+                {
+                    latestT = t;
+                    src = f;
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(src) || !System.IO.File.Exists(src))
+        {
+            CPH.LogWarn($"restoreProfileFromBackup: no backup found for '{profileName}'.");
+            return false;
+        }
+
+        var dst = ProfilePath(profileName);
+        try
+        {
+            System.IO.File.Copy(src, dst, overwrite: true);
+            CPH.LogInfo($"restoreProfileFromBackup: restored '{profileName}' from '{System.IO.Path.GetFileName(src)}'.");
+        }
+        catch (System.Exception ex)
+        {
+            CPH.LogWarn($"restoreProfileFromBackup: copy failed: {ex.Message}");
+            return false;
+        }
+
+        CPH.SetArgument("profileName", profileName);
+        var ok = loadProfile();
+        if (ok)
+            broadcastSplitData();
+        return ok;
+    }
+
+    // Apply flags from DoAction args — tolerant color parsing, no LINQ.
+    public bool setFlagsFromArgs()
+    {
+        bool? B(string key)
+        {
+            if (CPH.TryGetArg<bool>(key, out var b))
+                return b;
+            if (CPH.TryGetArg<string>(key, out var s))
+            {
+                s = s.Trim();
+                bool tmp;
+                if (bool.TryParse(s, out tmp))
+                    return tmp;
+                if (s == "1")
+                    return true;
+                if (s == "0")
+                    return false;
+            }
+
+            if (CPH.TryGetArg<int>(key, out var i))
+                return i != 0;
+            return null;
+        }
+
+        string S(string key)
+        {
+            if (CPH.TryGetArg<string>(key, out var s) && !string.IsNullOrWhiteSpace(s))
+                return s.Trim();
+            return null;
+        }
+
+        void SetIf(string name, bool? v, bool persist = true)
+        {
+            if (v.HasValue)
+                CPH.SetGlobalVar(name, v.Value, persist);
+        }
+
+        bool IsHexColor(string v)
+        {
+            if (string.IsNullOrWhiteSpace(v))
+                return false;
+            v = v.Trim();
+            if (!v.StartsWith("#"))
+                return false;
+            var hex = v.Substring(1);
+            if (!(hex.Length == 3 || hex.Length == 4 || hex.Length == 6 || hex.Length == 8))
+                return false;
+            for (int k = 0; k < hex.Length; k++)
+            {
+                if (!Uri.IsHexDigit(hex[k]))
+                    return false;
+            }
+
+            return true;
+        }
+
+        bool StartsWithCI(string v, string prefix)
+        {
+            return v.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // --- NEW: accept one JSON arg that carries all theme colors ---
+        // (This bypasses DoAction arg-count/size limits.)
+        try
+        {
+            if (CPH.TryGetArg<string>("themeJson", out var themeRaw) && !string.IsNullOrWhiteSpace(themeRaw))
+            {
+                var themeDict = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, string>>(themeRaw);
+                if (themeDict != null)
+                {
+                    foreach (var kv in themeDict)
+                    {
+                        var key = (kv.Key ?? "").Trim();
+                        var val = (kv.Value ?? "").Trim();
+                        if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(val))
+                            continue;
+                        bool ok = IsHexColor(val) || StartsWithCI(val, "rgb(") || StartsWithCI(val, "rgba(") || StartsWithCI(val, "hsl(") || StartsWithCI(val, "hsla(") || val.Equals("transparent", StringComparison.OrdinalIgnoreCase) || (val.IndexOf(' ') < 0);
+                        if (!ok)
+                        {
+                            CPH.LogWarn($"setFlagsFromArgs: themeJson ignored invalid CSS color for '{key}': '{val}'");
+                            continue;
+                        }
+
+                        // whitelist only known theme keys
+                        switch (key)
+                        {
+                            case "hitColor":
+                            case "normalColor":
+                            case "bodyTextColor":
+                            case "headerBgColor":
+                            case "headerTextColor":
+                            case "borderColor":
+                            case "currentOutlineColor":
+                            case "currentBgColor":
+                            case "flashStartColor":
+                            case "flashMidColor":
+                            case "pastZeroBgColor":
+                            case "pastZeroTextColor":
+                            case "footerBgColor":
+                            case "footerTextColor":
+                                CPH.SetGlobalVar(key, val, true);
+                                break;
+                            default:
+                                // silently ignore unknown keys
+                                break;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"setFlagsFromArgs: themeJson parse failed: {ex.Message}");
+        }
+
+        void SetColor(string argKey, string globalName = null)
+        {
+            var raw = S(argKey);
+            if (raw == null)
+                return;
+            var v = raw.Trim();
+            bool ok = IsHexColor(v) || StartsWithCI(v, "rgb(") || StartsWithCI(v, "rgba(") || StartsWithCI(v, "hsl(") || StartsWithCI(v, "hsla(") || v.Equals("transparent", StringComparison.OrdinalIgnoreCase) || (v.IndexOf(' ') < 0); // accept simple named colors without spaces
+            if (!ok)
+            {
+                CPH.LogWarn($"setFlagsFromArgs: ignoring unrecognized CSS color for '{argKey}': '{raw}'");
+                return;
+            }
+
+            CPH.SetGlobalVar(globalName ?? argKey, v, /*persist*/ true);
+        }
+
+        SetIf("showRunHits", B("showRunHits"), true);
+        SetIf("showBossHits", B("showBossHits"), true);
+        SetIf("showPB", B("showPB"), true);
+        SetIf("showSplitTotal", B("showSplitTotal"), true);
+        SetIf("wrapNavigation", B("wrapNavigation"), true);
+        SetIf("autoBroadcast", B("autoBroadcast"), true);
+        SetColor("hitColor");
+        SetColor("normalColor");
+        SetColor("bodyTextColor");
+        SetColor("headerBgColor");
+        SetColor("headerTextColor");
+        SetColor("borderColor");
+        SetColor("currentOutlineColor");
+        SetColor("currentBgColor");
+        SetColor("flashStartColor");
+        SetColor("flashMidColor");
+        SetColor("pastZeroBgColor");
+        SetColor("pastZeroTextColor");
+        SetColor("footerBgColor");
+        SetColor("footerTextColor");
+        SetIf("pbOnlyIfBetterByDefault", B("pbOnlyIfBetterByDefault"), true);
+        SetIf("profileBackupByDefault", B("profileBackupByDefault"), true);
+        broadcastSplitData();
+        exportState();
+        return true;
+    }
+
+    private void EnsureThemeDefaults()
+    {
+        void Seed(string key, string val)
+        {
+            if (CPH.GetGlobalVar<string>(key, true) == null)
+                CPH.SetGlobalVar(key, val, /*persist*/ true);
+        }
+
+        Seed("hitColor", "#ff0000");
+        Seed("normalColor", "#00000000");
+        Seed("bodyTextColor", "#EAE6CA");
+        Seed("headerBgColor", "#111");
+        Seed("headerTextColor", "#FDB515");
+        Seed("borderColor", "#777");
+        Seed("currentOutlineColor", "#FDB515");
+        Seed("currentBgColor", "#003344");
+        Seed("flashStartColor", "#ff0000");
+        Seed("flashMidColor", "#660000");
+        Seed("pastZeroBgColor", "#157515");
+        Seed("pastZeroTextColor", "#EAE6CA");
+        Seed("footerBgColor", "#111");
+        Seed("footerTextColor", "#FDB515");
+    }
+
+    // Only overwrite a color if the profile actually provides a value
+    private void SetColorIfPresent(string globalKey, string maybeValue)
+    {
+        if (!string.IsNullOrWhiteSpace(maybeValue))
+            CPH.SetGlobalVar(globalKey, maybeValue.Trim(), true);
+    }
+
+    // ===================== THEME PRESETS (dictionary-based) =====================
+    // Save current global theme colors into a preset file in /profiles/hitcounter/themes/*.json
+    public bool saveTheme()
+    {
+        if (!CPH.TryGetArg<string>("themeName", out var themeName) || string.IsNullOrWhiteSpace(themeName))
+        {
+            CPH.LogWarn("saveTheme: missing 'themeName' arg.");
+            return false;
+        }
+
+        bool backupIfExists = true;
+        CPH.TryGetArg<bool>("backupIfExists", out backupIfExists);
+        var t = new ThemeData
+        {
+            ThemeName = themeName.Trim(),
+            Schema = 1,
+            Values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        };
+        // Collect the exact keys your UI / overlay already uses
+        string[] keys =
+        {
+            "hitColor",
+            "normalColor",
+            "bodyTextColor",
+            "headerBgColor",
+            "headerTextColor",
+            "borderColor",
+            "currentOutlineColor",
+            "currentBgColor",
+            "flashStartColor",
+            "flashMidColor",
+            "pastZeroBgColor",
+            "pastZeroTextColor",
+            "footerBgColor",
+            "footerTextColor"
+        };
+        foreach (var k in keys)
+        {
+            var v = GetString(k, null, true);
+            if (!string.IsNullOrWhiteSpace(v))
+                t.Values[k] = v.Trim();
+        }
+
+        var path = ThemePath(t.ThemeName);
+        try
+        {
+            if (File.Exists(path) && backupIfExists)
+            {
+                string ts = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                string backup = Path.Combine(Path.GetDirectoryName(path) ?? ThemesRoot(), $"{Path.GetFileNameWithoutExtension(path)}_{ts}.bak.json");
+                File.Copy(path, backup, overwrite: false);
+            }
+
+            File.WriteAllText(path, Newtonsoft.Json.JsonConvert.SerializeObject(t, Newtonsoft.Json.Formatting.Indented));
+            ActiveTheme = t.ThemeName;
+            CPH.LogInfo($"Theme '{t.ThemeName}' saved to {path}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"saveTheme: write failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    // Load a preset and apply only theme colors (does not change splits/flags)
+    public bool loadTheme()
+    {
+        if (!CPH.TryGetArg<string>("themeName", out var themeName) || string.IsNullOrWhiteSpace(themeName))
+        {
+            CPH.LogWarn("loadTheme: missing 'themeName' arg.");
+            return false;
+        }
+
+        var path = ThemePath(themeName);
+        if (!File.Exists(path))
+        {
+            CPH.LogWarn($"loadTheme: theme '{themeName}' not found at {path}");
+            return false;
+        }
+
+        try
+        {
+            var raw = File.ReadAllText(path);
+            // Prefer ThemeData { Values = {...} }, but also tolerate plain dictionary files.
+            Dictionary<string, string> values = null;
+            try
+            {
+                var typed = Newtonsoft.Json.JsonConvert.DeserializeObject<ThemeData>(raw);
+                if (typed != null && typed.Values != null && typed.Values.Count > 0)
+                    values = typed.Values;
+            }
+            catch
+            { /* fall through to plain-dict */
+            }
+
+            if (values == null)
+                values = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, string>>(raw) ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            // Apply only known keys
+            string[] keys =
+            {
+                "hitColor",
+                "normalColor",
+                "bodyTextColor",
+                "headerBgColor",
+                "headerTextColor",
+                "borderColor",
+                "currentOutlineColor",
+                "currentBgColor",
+                "flashStartColor",
+                "flashMidColor",
+                "pastZeroBgColor",
+                "pastZeroTextColor",
+                "footerBgColor",
+                "footerTextColor"
+            };
+            foreach (var k in keys)
+            {
+                if (values.TryGetValue(k, out var v) && !string.IsNullOrWhiteSpace(v))
+                    SetColorIfPresent(k, v);
+            }
+
+            ActiveTheme = themeName.Trim();
+            CPH.LogInfo($"Theme '{themeName}' loaded.");
+            broadcastSplitData();
+            exportState();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"loadTheme: failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    public bool listThemes()
+    {
+        try
+        {
+            var root = ThemesRoot();
+            if (!Directory.Exists(root))
+            {
+                CPH.LogInfo("No themes directory found.");
+                return true;
+            }
+
+            var files = Directory.GetFiles(root, "*.json", SearchOption.TopDirectoryOnly);
+            var active = ActiveTheme;
+            if (files.Length == 0)
+            {
+                CPH.LogInfo("No theme presets saved yet.");
+                return true;
+            }
+
+            foreach (var f in files)
+            {
+                var name = Path.GetFileNameWithoutExtension(f);
+                var tag = (string.Equals(name, active, StringComparison.OrdinalIgnoreCase)) ? " (active)" : "";
+                CPH.LogInfo($"Theme: {name}{tag}");
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"listThemes: {ex.Message}");
+            return false;
+        }
+    }
+
+    public bool deleteTheme()
+    {
+        if (!CPH.TryGetArg<string>("themeName", out var themeName) || string.IsNullOrWhiteSpace(themeName))
+        {
+            CPH.LogWarn("deleteTheme: missing 'themeName' arg.");
+            return false;
+        }
+
+        try
+        {
+            var path = ThemePath(themeName);
+            if (!File.Exists(path))
+            {
+                CPH.LogWarn($"deleteTheme: theme '{themeName}' not found.");
+                return false;
+            }
+
+            File.Delete(path);
+            if (string.Equals(ActiveTheme, themeName, StringComparison.OrdinalIgnoreCase))
+                ActiveTheme = "";
+            CPH.LogInfo($"Theme '{themeName}' deleted.");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"deleteTheme: {ex.Message}");
+            return false;
+        }
+    }
+
+    // Restore a theme's JSON from a backup file, then load it.
+    public bool restoreThemeFromBackup()
+    {
+        if (!CPH.TryGetArg<string>("themeName", out var themeName) || string.IsNullOrWhiteSpace(themeName))
+        {
+            CPH.LogWarn("restoreThemeFromBackup: missing themeName");
+            return false;
+        }
+
+        string src = null;
+        // 1) If a specific backup file was provided, prefer it.
+        if (CPH.TryGetArg<string>("backupFile", out var backupFile) && !string.IsNullOrWhiteSpace(backupFile))
+        {
+            var cand = System.IO.Path.Combine(ThemesRoot(), backupFile);
+            if (System.IO.File.Exists(cand))
+                src = cand;
+        }
+
+        // 2) Otherwise, pick the most recent *.bak.json for this theme.
+        if (src == null)
+        {
+            try
+            {
+                var safe = SanitizeFileName(themeName);
+                var files = System.IO.Directory.GetFiles(ThemesRoot(), $"{safe}_*.bak.json", System.IO.SearchOption.TopDirectoryOnly);
+                System.DateTime latest = System.DateTime.MinValue;
+                foreach (var f in files)
+                {
+                    var t = System.IO.File.GetLastWriteTimeUtc(f);
+                    if (t > latest)
+                    {
+                        latest = t;
+                        src = f;
+                    }
+                }
+            }
+            catch (System.Exception ex)
+            {
+                CPH.LogWarn($"restoreThemeFromBackup: scan failed: {ex.Message}");
+            }
+        }
+
+        if (src == null)
+        {
+            CPH.LogWarn($"restoreThemeFromBackup: no backup found for '{themeName}'.");
+            return false;
+        }
+
+        var dst = ThemePath(themeName);
+        try
+        {
+            System.IO.File.Copy(src, dst, overwrite: true);
+            CPH.LogInfo($"restoreThemeFromBackup: restored '{themeName}' from '{System.IO.Path.GetFileName(src)}'.");
+        }
+        catch (System.Exception ex)
+        {
+            CPH.LogWarn($"restoreThemeFromBackup: copy failed: {ex.Message}");
+            return false;
+        }
+
+        // Load the restored theme and rebroadcast
+        CPH.SetArgument("themeName", themeName);
+        var ok = loadTheme();
+        if (ok)
+        {
+            broadcastSplitData();
+            exportState();
+        }
+
+        return ok;
+    }
+
+    private static string StripTimestampKey(string fileBaseNoExt)
+    {
+        // Handles "<name>_YYYYMMDD_HHMMSS"
+        // e.g., "MyTheme_20250814_120000" -> "MyTheme"
+        if (string.IsNullOrWhiteSpace(fileBaseNoExt))
+            return fileBaseNoExt;
+        var m = Regex.Match(fileBaseNoExt, @"^(.*)_(\d{8})_(\d{6})$", RegexOptions.CultureInvariant);
+        return m.Success ? m.Groups[1].Value : fileBaseNoExt;
+    }
+
+    // ===== Open Config UI / Folder =====
+    public bool LaunchConfigWindow()
+    {
+        try
+        {
+            ensureOverlayAssets();
+            var cfgPath = ConfigHtmlPath();
+            if (!File.Exists(cfgPath))
+            {
+                WriteFileIfMissing(cfgPath, DefaultConfigHtml(), true);
+                WriteFileIfMissing(ConfigJsPath(), DefaultConfigJs(), true);
+            }
+
+            var fileUrl = new Uri(cfgPath).AbsoluteUri; // e.g., file:///C:/.../config.html
+            var ok = OpenInAnyBrowser(fileUrl);
+            if (!ok)
+                CPH.LogWarn("No suitable browser found. Please open the file URL manually: " + fileUrl);
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"LaunchConfigWindow failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    public bool LaunchOverlayFolder()
+    {
+        try
+        {
+            var folder = System.IO.Path.GetDirectoryName(ConfigHtmlPath());
+            if (string.IsNullOrEmpty(folder) || !System.IO.Directory.Exists(folder))
+            {
+                ensureOverlayAssets();
+                folder = System.IO.Path.GetDirectoryName(ConfigHtmlPath());
+            }
+
+            return OpenInDefaultApp(folder, "overlay folder", preferPathNotUri: true);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"LaunchOverlayFolder failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    // Small utility that tries multiple strategies per OS
+    // Requires: using System; using System.IO; using System.Diagnostics;
+    // Small utility that tries multiple strategies per OS
+    private bool OpenInDefaultApp(string target, string label, bool preferPathNotUri = false)
+    {
+        try
+        {
+            // Primary: UseShellExecute on the target (URI or path)
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = target,
+                UseShellExecute = true
+            };
+            System.Diagnostics.Process.Start(psi);
+            CPH.LogInfo($"Opened {label}: {target}");
+            return true;
+        }
+        catch
+        {
+            // Fallbacks by platform
+            try
+            {
+                var plat = System.Environment.OSVersion.Platform;
+                bool isWindows = plat == System.PlatformID.Win32NT;
+                bool isMac = plat == System.PlatformID.MacOSX || (plat == System.PlatformID.Unix && System.IO.Directory.Exists("/Applications") && System.IO.Directory.Exists("/System"));
+                bool isLinux = plat == System.PlatformID.Unix && !isMac;
+                if (isWindows)
+                {
+                    // explorer opens files, folders, and URLs
+                    System.Diagnostics.Process.Start("explorer.exe", $"\"{target}\"");
+                }
+                else if (isMac)
+                {
+                    System.Diagnostics.Process.Start("open", $"\"{target}\"");
+                }
+                else if (isLinux)
+                {
+                    System.Diagnostics.Process.Start("xdg-open", $"\"{target}\"");
+                }
+                else
+                {
+                    throw new System.PlatformNotSupportedException($"Unknown platform for opening {label}.");
+                }
+
+                CPH.LogInfo($"Opened (fallback) {label}: {target}");
+                return true;
+            }
+            catch (System.Exception ex2)
+            {
+                CPH.LogWarn($"OpenInDefaultApp failed for {label}: {ex2.Message}");
+                return false;
+            }
+        }
+    }
+
+    private bool OpenInAnyBrowser(string urlOrPath)
+    {
+        try
+        {
+            // Normalize to URL
+            string url = Uri.IsWellFormedUriString(urlOrPath, UriKind.Absolute) ? urlOrPath : new Uri(Path.GetFullPath(urlOrPath)).AbsoluteUri;
+            var plat = Environment.OSVersion.Platform;
+            bool isWindows = plat == PlatformID.Win32NT;
+            bool isMac = plat == PlatformID.MacOSX || (plat == PlatformID.Unix && Directory.Exists("/Applications") && Directory.Exists("/System"));
+            bool isLinux = plat == PlatformID.Unix && !isMac;
+            if (isWindows)
+            {
+                // Prefer explicit browsers to avoid .html association opening an editor
+                if (TryOpenWithWindowsBrowser(url))
+                    return true;
+                // Last-ditch: Shell out to URL handler (may still hit editor for file://)
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "cmd",
+                    Arguments = $"/c start \"\" \"{url}\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                Process.Start(psi);
+                return true;
+            }
+            else if (isMac)
+            {
+                // Default browser
+                if (TryStart("open", $"\"{url}\""))
+                    return true;
+                // Fallbacks: force a specific browser if installed
+                if (TryStart("open", "-a \"Google Chrome\" \"" + url + "\""))
+                    return true;
+                if (TryStart("open", "-a \"Microsoft Edge\" \"" + url + "\""))
+                    return true;
+                if (TryStart("open", "-a \"Firefox\" \"" + url + "\""))
+                    return true;
+                return false;
+            }
+            else if (isLinux)
+            {
+                // Default browser
+                if (TryStart("xdg-open", $"\"{url}\""))
+                    return true;
+                // Fallbacks: try common browser bins directly
+                if (TryStart("google-chrome", $"\"{url}\""))
+                    return true;
+                if (TryStart("chromium-browser", $"\"{url}\""))
+                    return true;
+                if (TryStart("brave-browser", $"\"{url}\""))
+                    return true;
+                if (TryStart("firefox", $"\"{url}\""))
+                    return true;
+                return false;
+            }
+            else
+            {
+                throw new PlatformNotSupportedException("Unsupported platform.");
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogWarn($"OpenInAnyBrowser failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    // Helper that safely attempts a process start
+    private bool TryStart(string fileName, string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = args ?? "",
+                UseShellExecute = false
+            };
+            Process.Start(psi);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // Tries common install paths for Edge/Chrome/Firefox/Brave/Opera on Windows
+    private bool TryOpenWithWindowsBrowser(string url)
+    {
+        string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        string la = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string ru = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var candidates = new[]
+        {
+            // Chrome
+            Path.Combine(pf, "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(la, "Google", "Chrome", "Application", "chrome.exe"),
+            "chrome.exe",
+            // Firefox
+            Path.Combine(pf, "Mozilla Firefox", "firefox.exe"),
+            Path.Combine(pf86, "Mozilla Firefox", "firefox.exe"),
+            "firefox.exe",
+            // Opera
+            Path.Combine(ru, "Opera Software", "Opera Stable", "opera.exe"),
+            Path.Combine(la, "Programs", "Opera", "opera.exe"),
+            "opera.exe",
+            // Edge
+            Path.Combine(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+            "msedge.exe", // in PATH
+            // Brave
+            Path.Combine(pf, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            Path.Combine(pf86, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            Path.Combine(la, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            "brave.exe",
+
+        };
+        foreach (var exe in candidates)
+        {
+            try
+            {
+                if (exe.Contains("\\") && !File.Exists(exe))
+                    continue; // absolute path check
+                var psi = new ProcessStartInfo
+                {
+                    FileName = exe,
+                    Arguments = $"\"{url}\"",
+                    UseShellExecute = false
+                };
+                Process.Start(psi);
+                CPH.LogInfo($"Opened with browser: {exe}");
+                return true;
+            }
+            catch
+            { /* try next */
+            }
+        }
+
+        return false;
+    }
+}
