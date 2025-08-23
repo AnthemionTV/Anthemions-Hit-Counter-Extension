@@ -11,7 +11,7 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
   
 ## Setup
 1) Launch Streamer.Bot
-2) Copy import string and past into Streamer.Bot import window or drag import file into Streamer.Bot Import Window (this will not work if you are in administrator mode). 
+2) Copy import string and paste into Streamer.Bot import window or drag import file into Streamer.Bot Import Window (this will not work if you are in administrator mode). 
 3) Run "FIRST TIME SETUP" Action in the "Anthemion's Hit Counter Extension actions group. This will create all of the necessary files for the extension to work within your Streamer.Bot folder. You can also find the location of these files within the configuration window itself.
 4) Run "Configuration Action." This will open the configuration window where you can create your split design (click apply settings to committ changes), splits (apply table to Streamer.bot to commit changes, resize to set split number total), and start the time via UI. After configuring your splits to your liking using the provided preview window, be sure to save what you have made!
 5) Under the run time, the first url provided is the location of your overlay, add this as a browser source within OBS, crop and resize to your liking (Note: The extra red colored text can be useful for trouble shooting).
