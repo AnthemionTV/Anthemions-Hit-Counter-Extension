@@ -12,10 +12,10 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 4) Run "Configuration Action." This will open the configuration window where you can create your split design (click apply settings to committ changes), splits (apply table to Streamer.bot to commit changes, resize to set split number total), and start the time via UI. After configuring your splits to your liking using the provided preview window, be sure to save what you have made!
 5) Under the run time, you will the first url provided is the location of your overlay, add this as a browser source within OBS, crop and resize to your liking (extra text can be useful for trouble shooting).
 6) Assign Hot Key Trigger the following actions (Core > Inputs > Key Press):
-   -[AHC] Add Boss Hit
-   -[AHC] Add Run Hit
-   -[AHC] Split Increase
-   -[AHC] Reset Run
+   - [AHC] Add Boss Hit
+   - [AHC] Add Run Hit
+   - [AHC] Split Increase
+   - [AHC] Reset Run
 7) Enjoy!
 
 ## Planned Features
