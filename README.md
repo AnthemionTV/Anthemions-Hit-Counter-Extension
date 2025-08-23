@@ -5,7 +5,7 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 ## Requirements
 - [Streamer.bot](https://streamer.bot/)
 - Imagination
-##Setup
+## Setup
 1) Launch Streamer.Bot
 2) Copy import string and past into Streamer.Bot import window or drag import file into Streamer.Bot Import Window (this will not work if you are in administrator mode). 
 3) Run "FIRST TIME STEPUP" Action in the "Anthemion's Hit Counter Extension actions group. This will create all of the necessary files for the extension to work within your Streamer.Bot folder. You can also find the location of these files within the configuration window itself.
