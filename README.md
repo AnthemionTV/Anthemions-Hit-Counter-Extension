@@ -7,7 +7,7 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 - Imagination
 
 ## Features
-
+- WIP
   
 ## Setup
 1) Launch Streamer.Bot
@@ -28,7 +28,13 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 - Automated OBS Overlay Source Creation
 - Quality of life customizations (set preferred browser, UI improvements)
 - Run statistics Display (most common split first hit, highest hit, most consistent, etc..)
-- Autosplitter functionality or Compatability 
+- Autosplitter functionality or Compatability
+- Counter Type (e.g. split clear/ not clear) as opposed to numerical values.
+- Renamable columns via UI
+
+## Advanced Split Making
+- WIP
+
 
 ## Known Issues
 - The hit counter still shows some debug information when first starting. This will be phased out over time. To display your hitcounter, a web socket request must be sent. Actions such as starting the run timer or reset run will display the overlay. 
