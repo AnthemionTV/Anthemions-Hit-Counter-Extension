@@ -7,20 +7,25 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 - Imagination
 
 ## Features
-- WIP
+- UI for Configuration including split names, color changes, split content, and more.
+- Run Timer
+- Hot key support via Streamer.Bot "triggers"
+- Access to split data for personalization such as splits with complex visuals, Hit/ PB specific events, autorunning/ closing predictions, automating split names for channel redeems, and more!
+- HTML Overlay using Websockets
   
 ## Setup
 1) Launch Streamer.Bot
-2) Copy import string and paste into Streamer.Bot import window or drag import file into Streamer.Bot Import Window (this will not work if you are in administrator mode). 
-3) Run "FIRST TIME SETUP" Action in the "Anthemion's Hit Counter Extension" actions group. This will create all of the necessary files for the extension to work within your Streamer.Bot folder. You can also find the location of these files within the configuration window itself.
-4) Run "Configuration Action." This will open the configuration window in a browser where you can create your split design (click apply settings to committ changes), splits (apply table to Streamer.bot to commit changes, resize to set split number total), and start the time via UI. After configuring your splits to your liking using the provided preview window, be sure to save what you have made!
-5) Under the run time, the first url provided is the location of your overlay, add this as a browser source within OBS, crop and resize to your liking (Note: The extra red colored text can be useful for trouble shooting).
-6) Assign hot key "Triggers" to the following actions (Core > Inputs > Key Press):
+2) Ensure Websocket is turned on (Servers/Clients > Toggle 'On') _Default is 127.0.0.1:8080_
+3) Copy import string and paste into Streamer.Bot import window or drag import file into Streamer.Bot Import Window (this will not work if you are in administrator mode). 
+4) Run "FIRST TIME SETUP" Action in the "Anthemion's Hit Counter Extension" actions group. This will create all of the necessary files for the extension to work within your Streamer.Bot folder. You can also find the location of these files within the configuration window itself.
+5) Run "Configuration Action." This will open the configuration window in a browser where you can create your split design (click apply settings to committ changes), splits (apply table to Streamer.bot to commit changes, resize to set split number total), and start the time via UI. After configuring your splits to your liking using the provided preview window, be sure to save what you have made!
+6) Under the run time, the first url provided is the location of your overlay, add this as a browser source within OBS, crop and resize to your liking (Note: The extra red colored text can be useful for trouble shooting).
+7) Assign hot key "Triggers" to the following actions (Core > Inputs > Key Press):
    - [AHC] Add Boss Hit
    - [AHC] Add Run Hit
    - [AHC] Split Increase
    - [AHC] Reset Run 
-7) Enjoy!
+8) Enjoy!
 
 ## Planned Features
 - Split specific timers and other speed run overlay features (Sum of best, PB indicatirs, pace indicators)
@@ -33,7 +38,9 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 - Renamable columns via UI
 
 ## Advanced Split Making
-- WIP
+- Tutorial Coming Soon
+<img width="199" height="297" alt="image" src="https://github.com/user-attachments/assets/3ea92ed7-8776-4e8f-9d23-84d8f90b5a50" />
+
 
 
 ## Known Issues
