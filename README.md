@@ -46,6 +46,5 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 
 ## Known Issues
 - The hit counter still shows some debug information when first starting. This will be phased out over time. To display your hitcounter, a web socket request must be sent. Actions such as starting the run timer or reset run will display the overlay. 
-
-- Two many quick changes to the UI can cause some inputs to be lost (this is in testing more rapid than is likely in typical use cases).
+- Too many quick changes to the UI can cause some inputs to be lost (this is in testing more rapid than is likely in typical use cases).
 - Changing split order may result in losing some stored values specific to the profile (i.e. PBs). I recommend saveing to a new profile until feature is added to the UI to avoid data loss.
