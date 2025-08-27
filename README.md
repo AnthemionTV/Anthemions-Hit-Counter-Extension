@@ -36,6 +36,7 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 - Autosplitter functionality or Compatability
 - Counter Type (e.g. split clear/ not clear) as opposed to numerical values.
 - Renamable columns via UI
+- Change order of splits (currently this may impact stored PBs or other values depending on how it is done)
 
 ## Advanced Split Making
 - Tutorial Coming Soon
@@ -47,3 +48,4 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 - The hit counter still shows some debug information when first starting. This will be phased out over time. To display your hitcounter, a web socket request must be sent. Actions such as starting the run timer or reset run will display the overlay. 
 
 - Two many quick changes to the UI can cause some inputs to be lost (this is in testing more rapid than is likely in typical use cases).
+- Changing split order may result in losing some stored values specific to the theme (i.e. PBs). Save to a new theme until feature is added to the UI to avoid data loss.
