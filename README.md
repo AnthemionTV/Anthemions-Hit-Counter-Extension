@@ -40,7 +40,11 @@ An extension for Streamer.bot 1.0+ that allows for "hit" tracking.
 
 ## Advanced Split Making
 - Tutorial Coming Soon
-<img width="199" height="297" alt="image" src="https://github.com/user-attachments/assets/3ea92ed7-8776-4e8f-9d23-84d8f90b5a50" />
+
+https://github.com/user-attachments/assets/7ddc01e1-3ca9-473f-bf05-f2fb29ccb626
+
+https://github.com/user-attachments/assets/9a80130c-9184-4ff9-aea9-9ed6b41074d2
+
 
 
 
